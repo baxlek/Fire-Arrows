@@ -14,6 +14,7 @@
 #include "d/d_particle_name.h"
 #include "d/d_save.h"
 #include "f_op/f_op_actor_mng.h"
+#include "f_pc/f_pc_manager.h"
 
 DEFINE_MOD();
 
@@ -199,9 +200,21 @@ static const dCcD_SrcCps l_igniteCpsSrc = {
 // arrows, so both can be re-anchored to each arrow's current position every frame (see
 // updateFireArrowEffect below). daArrow_c has no spare fields to stash these in, unlike the enemy
 // fire arrow actor's own mFireEMKeys/mCcFireEffSph, so they're tracked externally here instead,
-// keyed by the arrow's actor pointer.
+// keyed by the arrow's actor pointer (see arrowId below for why the pointer alone isn't enough).
 struct TrackedFireArrow {
     daArrow_c* arrow = nullptr;
+    // The actor framework recycles daArrow_c instances out of a small fixed pool: once an arrow
+    // is deleted (embedded in a wall, landed, etc.), its memory is free to be handed straight back
+    // out to the very next arrow the player nocks. A raw daArrow_c* is therefore not a reliable
+    // way to tell "the same arrow, still in flight" apart from "a brand new arrow that just
+    // happens to have been allocated at the same address" - which, prior to tracking this,
+    // resulted in a new arrow inheriting a stale slot's already-hit collision bookkeeping
+    // (igniteStts) untouched, silently suppressing that new arrow's own ignition hits (works once
+    // right after the pool's addresses are all still fresh, then increasingly fails as arrows
+    // reuse addresses). fpc_ProcID (fpcM_GetID(), backed by fpcBs_MakeOfId()) is the actor
+    // framework's own per-spawn-unique identifier, unaffected by address reuse, and is what
+    // actually distinguishes these two cases - see trackFireArrow below.
+    fpc_ProcID arrowId = fpcM_ERROR_PROCESS_ID_e;
     u32 particleKey = 0;
     // Handed to the emitter via setUserWork() below; must outlive the emitter itself, so it's
     // stored here rather than as a stack temporary.
@@ -230,21 +243,13 @@ static constexpr int MAX_TRACKED_FIRE_ARROWS = 8;
 static TrackedFireArrow g_fireArrows[MAX_TRACKED_FIRE_ARROWS];
 static int g_nextFireArrowSlot = 0;
 
-// Called both when an arrow is nocked (drawn back) and again when it's actually fired, to start
-// tracking its fire trail particle and (re-)initialize its ignition collider. Idempotent: calling
-// it again for an arrow that's already tracked (e.g. the shooting-time call, for an arrow that was
-// already tracked at nock time) is a no-op, so the same arrow never ends up straddling two ring
-// buffer slots at once.
-static void trackFireArrow(daArrow_c* arrow) {
-    for (TrackedFireArrow& slot : g_fireArrows) {
-        if (slot.arrow == arrow) {
-            return;
-        }
-    }
-
-    TrackedFireArrow& slot = g_fireArrows[g_nextFireArrowSlot];
-    g_nextFireArrowSlot = (g_nextFireArrowSlot + 1) % MAX_TRACKED_FIRE_ARROWS;
+// (Re-)initializes a ring buffer slot for arrow/id, resetting every piece of per-arrow state -
+// this is the one and only place that's allowed to happen, so trackFireArrow (the only caller)
+// can't accidentally skip it for what's actually a brand new arrow instance (see arrowId's comment
+// on TrackedFireArrow above).
+static void initFireArrowSlot(TrackedFireArrow& slot, daArrow_c* arrow, fpc_ProcID id) {
     slot.arrow = arrow;
+    slot.arrowId = id;
     slot.particleKey = 0;
     slot.igniteActive = false;
     // Same Init() args daArrow_c itself uses for field_0x64c (d_a_arrow.cpp), so the ignition
@@ -253,6 +258,32 @@ static void trackFireArrow(daArrow_c* arrow) {
     slot.igniteStts.Init(10, 0xff, arrow);
     slot.igniteCps.Set(l_igniteCpsSrc);
     slot.igniteCps.SetStts(&slot.igniteStts);
+}
+
+// Called both when an arrow is nocked (drawn back) and again when it's actually fired, to start
+// tracking its fire trail particle and (re-)initialize its ignition collider. Idempotent for the
+// same arrow instance: calling it again for an arrow that's already tracked (e.g. the
+// shooting-time call, for an arrow that was already tracked at nock time) is a no-op, so the same
+// arrow never ends up straddling two ring buffer slots at once. Not idempotent across different
+// arrow instances that happen to share an address (see arrowId's comment on TrackedFireArrow
+// above): that case re-initializes the existing slot in place instead of treating it as already
+// tracked, so a reused address can never keep serving a new arrow stale collision state left over
+// from whatever previously occupied that memory.
+static void trackFireArrow(daArrow_c* arrow) {
+    fpc_ProcID id = fpcM_GetID(arrow);
+
+    for (TrackedFireArrow& slot : g_fireArrows) {
+        if (slot.arrow == arrow) {
+            if (slot.arrowId != id) {
+                initFireArrowSlot(slot, arrow, id);
+            }
+            return;
+        }
+    }
+
+    TrackedFireArrow& slot = g_fireArrows[g_nextFireArrowSlot];
+    g_nextFireArrowSlot = (g_nextFireArrowSlot + 1) % MAX_TRACKED_FIRE_ARROWS;
+    initFireArrowSlot(slot, arrow, id);
 }
 
 // Called once the arrow is actually fired, to turn on the ignition collider for an already
