@@ -48,6 +48,11 @@ DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, IsMixItemOff);
 // original code). This is where we mark the arrow as a fire arrow if the combo is active.
 DEFINE_HOOK(&daArrow_c::arrowShooting, ArrowShooting);
 
+// Hook target: the arrow's per-frame update. daArrow_c has no arrow-type value for "fire" (unlike
+// the enemy fire arrows in d_a_e_arrow.cpp), so we detect it via the attack material we set
+// ourselves in on_arrow_shooting_pre and use this to keep the fire trail following the arrow.
+DEFINE_HOOK(&daArrow_c::execute, ArrowExecute);
+
 // Slot temporarily disguised by disguiseLanternPre(), restored by restoreLanternPost().
 // NO_MIX_ITEM means "nothing to restore". These hooks never nest (each menu function above runs
 // to completion before the next is called), so a single slot is enough to track the disguise.
@@ -74,8 +79,15 @@ static HookAction on_set_mix_item_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-static void on_set_mix_item_post(ModContext*, void*, void*, void*) {
+static void on_set_mix_item_post(ModContext*, void* args, void*, void*) {
     restoreLanternPost();
+
+    // setMixItem() reloads the sliding combo-icon textures (via setJumpItem -> setSelectItem)
+    // from save data *before* our restore above runs, so if the Lantern was involved it captured
+    // the disguised Hawkeye icon instead. Now that the real item is back in the save slot, call
+    // setJumpItem() again to reload the correct icon. Harmless to call unconditionally: it just
+    // re-reads the (now-correct) current combo state, exactly like the original call did.
+    mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
 }
 
 static HookAction on_is_mix_item_on_pre(ModContext*, void* args, void*, void*) {
@@ -119,6 +131,47 @@ static bool checkBowLanternCombo() {
     return false;
 }
 
+// Tracks the fire trail particle for the player's own in-flight fire arrows, so it can be
+// re-anchored to each arrow's current position every frame (see updateFireArrowEffect below).
+// daArrow_c has no spare field to stash this in, unlike the enemy fire arrow actor's own
+// mFireEMKeys, so it's tracked externally here instead, keyed by the arrow's actor pointer.
+struct TrackedFireArrow {
+    daArrow_c* arrow = nullptr;
+    u32 particleKey = 0;
+};
+
+// The player only ever has a handful of arrows in flight at once; a small ring buffer is more
+// than enough, and simply evicts the oldest tracked arrow (long since landed/despawned by then)
+// if it somehow fills up.
+static constexpr int MAX_TRACKED_FIRE_ARROWS = 8;
+static TrackedFireArrow g_fireArrows[MAX_TRACKED_FIRE_ARROWS];
+static int g_nextFireArrowSlot = 0;
+
+// Called once, right when an arrow is fired as part of the combo, to start tracking its fire
+// trail particle.
+static void trackFireArrow(daArrow_c* arrow) {
+    TrackedFireArrow& slot = g_fireArrows[g_nextFireArrowSlot];
+    g_nextFireArrowSlot = (g_nextFireArrowSlot + 1) % MAX_TRACKED_FIRE_ARROWS;
+    slot.arrow = arrow;
+    slot.particleKey = 0;
+}
+
+// Called every frame for every live fire arrow (see on_arrow_execute_post). Re-issues the same
+// particle emitter (by reusing its key) at the arrow's up-to-date position, exactly like the
+// Bulblin (Bokoblin) archers' own fire arrows keep their trail attached to the arrow in
+// fire_eff_set() (d_a_e_arrow.cpp) instead of spawning a new, stationary burst once.
+static void updateFireArrowEffect(daArrow_c* arrow) {
+    for (TrackedFireArrow& slot : g_fireArrows) {
+        if (slot.arrow == arrow) {
+            static const cXyz scale = {1.0f, 1.0f, 1.0f};
+            slot.particleKey =
+                dComIfGp_particle_set(slot.particleKey, dPa_RM(ID_ZI_S_RD_ARROWFIRE_A),
+                                      &arrow->current.pos, &arrow->shape_angle, &scale);
+            return;
+        }
+    }
+}
+
 static HookAction on_arrow_shooting_pre(ModContext*, void* args, void*, void*) {
     daArrow_c* arrow = mods::arg<daArrow_c*>(args, 0);
 
@@ -134,14 +187,19 @@ static HookAction on_arrow_shooting_pre(ModContext*, void* args, void*, void*) {
     // dCcD_MTRL_LIGHT a few lines below in the original function. This makes the arrow ignite
     // flammable targets exactly like a bokoblin archer's fire arrow or a lit lantern swing does.
     arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
+    trackFireArrow(arrow);
 
-    static const cXyz scale = {1.0f, 1.0f, 1.0f};
-    dComIfGp_particle_set(dPa_RM(ID_ZI_S_RD_ARROWFIRE_A), &arrow->current.pos, &arrow->shape_angle,
-                          &scale);
     Z2GetAudioMgr()->seStart(Z2SE_OBJ_ARROW_SHOT_FIRE, &arrow->current.pos, 0, 0, 1.0f, 1.0f, -1.0f,
                              -1.0f, 0);
 
     return HOOK_CONTINUE;
+}
+
+static void on_arrow_execute_post(ModContext*, void* args, void*, void*) {
+    daArrow_c* arrow = mods::arg<daArrow_c*>(args, 0);
+    if (arrow->field_0x688.GetAtMtrl() == dCcD_MTRL_FIRE) {
+        updateFireArrowEffect(arrow);
+    }
 }
 
 extern "C" {
@@ -185,6 +243,12 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     result = mods::hook::add_pre<ArrowShooting>(on_arrow_shooting_pre);
     if (result != MOD_OK) {
         mods::log::error("failed to install pre hook on_arrow_shooting_pre");
+        return result;
+    }
+
+    result = mods::hook::add_post<ArrowExecute>(on_arrow_execute_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_arrow_execute_post");
         return result;
     }
 
