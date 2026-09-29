@@ -252,6 +252,11 @@ static bool isArrowStationary(daArrow_c* arrow) {
 // (ID_IT_JN_ARWFIR_FIRE00), which - it turns out - is a dead resource ID never referenced anywhere
 // else in the game and never actually renders regardless of which pack is loaded.
 //
+// While the arrow is nocked (waiting to be released), the flame is drawn just in front of the
+// player's face and at the full "impact-sized" scale would cover most of the first-person aiming
+// view. Everywhere else (flying, or stuck after landing) keeps the normal, unscaled size.
+static constexpr f32 NOCKED_FLAME_SCALE = 1.0f / 3.0f;
+
 // Also re-anchors the ignition collider (see l_igniteSphSrc above) to the arrow's current
 // position every frame, the same way the arrow's own "stuck in wall" collider (field_0x7cc) is
 // simply re-issued at current.pos each frame rather than swept.
@@ -286,6 +291,9 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
             if (emitter != NULL) {
                 emitter->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
                 emitter->setUserWork((uintptr_t)&slot.velocity);
+
+                f32 scale = arrow->mProcFunc == &daArrow_c::procWait ? NOCKED_FLAME_SCALE : 1.0f;
+                emitter->setGlobalParticleScale(scale, scale);
             }
 
             if (slot.igniteActive) {
