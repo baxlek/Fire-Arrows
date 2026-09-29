@@ -17,7 +17,7 @@
       "major": 1,
       "min_minor": 0,
       "optional": false
-    },
+    }
   ],
   "exports": []
 }
