@@ -138,6 +138,9 @@ static bool checkBowLanternCombo() {
 struct TrackedFireArrow {
     daArrow_c* arrow = nullptr;
     u32 particleKey = 0;
+    // Handed to the emitter via setUserWork() below; must outlive the emitter itself, so it's
+    // stored here rather than as a stack temporary.
+    cXyz velocity = {0.0f, 0.0f, 0.0f};
 };
 
 // The player only ever has a handful of arrows in flight at once; a small ring buffer is more
@@ -159,14 +162,24 @@ static void trackFireArrow(daArrow_c* arrow) {
 // Called every frame for every live fire arrow (see on_arrow_execute_post). Re-issues the same
 // particle emitter (by reusing its key) at the arrow's up-to-date position, exactly like the
 // Bulblin (Bokoblin) archers' own fire arrows keep their trail attached to the arrow in
-// fire_eff_set() (d_a_e_arrow.cpp) instead of spawning a new, stationary burst once.
+// fire_eff_set() (d_a_e_arrow.cpp) instead of spawning a new, stationary burst once. Also mirrors
+// that function's use of the particle "trace" callback: without it, each emitter only knows the
+// position it was (re)issued at and its own particles don't get interpolated towards the arrow's
+// position in between frames, so the trail can lag behind or, if re-issued too infrequently
+// relative to the arrow's speed, appear to not be there at all.
 static void updateFireArrowEffect(daArrow_c* arrow) {
     for (TrackedFireArrow& slot : g_fireArrows) {
         if (slot.arrow == arrow) {
-            static const cXyz scale = {1.0f, 1.0f, 1.0f};
+            slot.velocity = arrow->speed;
             slot.particleKey =
                 dComIfGp_particle_set(slot.particleKey, dPa_RM(ID_ZI_S_RD_ARROWFIRE_A),
-                                      &arrow->current.pos, &arrow->shape_angle, &scale);
+                                      &arrow->current.pos, &arrow->shape_angle, NULL);
+
+            JPABaseEmitter* emitter = dComIfGp_particle_getEmitter(slot.particleKey);
+            if (emitter != NULL) {
+                emitter->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
+                emitter->setUserWork((uintptr_t)&slot.velocity);
+            }
             return;
         }
     }
