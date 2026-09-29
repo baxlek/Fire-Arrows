@@ -1,7 +1,7 @@
 {
-  "id": "com.example.my_mod",
-  "name": "My Mod",
+  "id": "com.example.fire_arrows",
+  "name": "Fire Arrows",
   "version": "@PROJECT_VERSION@",
   "author": "You",
-  "description": "An example Dusklight mod"
+  "description": "Combine the Lantern with the Hero's Bow to shoot flaming arrows, just like a Bulblin archer, using oil from your lantern."
 }
