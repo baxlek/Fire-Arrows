@@ -3,35 +3,525 @@
 #include "mods/svc/log.hpp"
 
 // Game includes
+#include "Z2AudioLib/Z2AudioMgr.h"
+#include "Z2AudioLib/Z2SeMgr.h"
+#include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_arrow.h"
+#include "d/d_cc_d.h"
+#include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
+#include "d/d_menu_ring.h"
+#include "d/d_particle_name.h"
+#include "d/d_save.h"
 #include "f_op/f_op_actor_mng.h"
+#include "f_pc/f_pc_manager.h"
 
 DEFINE_MOD();
 
-IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(HookService, svc_hook);
+IMPORT_SERVICE(LogService, svc_log);
 
-// Example game hook: turn heart drops into green rupees.
-DEFINE_HOOK(fopAcM_createItem, CreateItem);
+// --------------------------------------------------------------------------------------------
+// Fire Arrows
+//
+// Lets the player mix the Lantern into the Bow's C-button slot, exactly like the vanilla
+// Bow & Hawkeye combo. While the combo is equipped, every arrow fired is lit on the way out,
+// igniting whatever it hits the same way the fire arrows shot by Bulblin (Bokoblin) archers do.
+// Each shot costs the same amount of lantern oil as a single lantern swing.
+// --------------------------------------------------------------------------------------------
 
-static HookAction on_create_item_pre(ModContext*, void* args, void*, void*) {
-    int& itemNo = mods::arg_ref<int>(args, 1);
-    if (itemNo == dItemNo_HEART_e) {
-        itemNo = dItemNo_GREEN_RUPEE_e;
+// dComIfGs_getMixItemIndex() returns this when a C-button slot has no item mixed into it.
+static constexpr u8 NO_MIX_ITEM = 0xFF;
+
+// Hook targets: the menu code that lets the player drag one item onto another to combine them
+// (used natively for Bow+Bomb and Bow+Hawkeye), plus the two functions that decide whether to
+// show the "Bow & Arrow Combo"/"Combo Off" prompt while an item is highlighted. All three have
+// their own whitelist switch that doesn't know about the Lantern, so while any of them run we
+// briefly present the highlighted Lantern as a Hawkeye (a combo the whitelists already accept),
+// then restore the real item right after the call. This reuses all of the vanilla
+// combining/bookkeeping and prompt-display logic instead of reimplementing it.
+DEFINE_HOOK(&dMenu_Ring_c::setMixItem, SetMixItem);
+DEFINE_HOOK(&dMenu_Ring_c::isMixItemOn, IsMixItemOn);
+DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, IsMixItemOff);
+
+// Hook target: the moment an arrow is actually released, where the game already special-cases
+// the arrow's attack material per arrow type (see the ARROW_TYPE_LIGHT branch below it in the
+// original code). This is where we (re-)mark the arrow as a fire arrow if the combo is active,
+// and where the fire-arrow's ignition effect (as opposed to its purely cosmetic flame, which can
+// already be showing at this point - see on_alink_make_arrow_post below) actually turns on.
+DEFINE_HOOK(&daArrow_c::arrowShooting, ArrowShooting);
+
+// Hook target: the moment the Hero's Bow nocks a new arrow (on drawing the bow back, and again
+// whenever the arrow type is switched mid-draw), well before it's actually released. This is
+// where we start the fire arrow's cosmetic flame effect early, so the arrowhead already looks lit
+// while the shot is being lined up, exactly like it looks once fired.
+DEFINE_HOOK(&daAlink_c::makeArrow, AlinkMakeArrow);
+
+// Hook target: the arrow's per-frame update. daArrow_c has no arrow-type value for "fire" (unlike
+// the enemy fire arrows in d_a_e_arrow.cpp), so we detect it via the attack material we set
+// ourselves in on_arrow_shooting_pre and use this to keep the fire trail following the arrow.
+DEFINE_HOOK(&daArrow_c::execute, ArrowExecute);
+
+// Slot temporarily disguised by disguiseLanternPre(), restored by restoreLanternPost().
+// NO_MIX_ITEM means "nothing to restore". These hooks never nest (each menu function above runs
+// to completion before the next is called), so a single slot is enough to track the disguise.
+static u8 g_disguisedItemSlot = NO_MIX_ITEM;
+
+static void disguiseLanternPre(dMenu_Ring_c* menu) {
+    u8 slot = menu->mItemSlots[menu->mCurrentSlot];
+
+    if (dComIfGs_getItem(slot, false) == dItemNo_KANTERA_e) {
+        dComIfGs_setItem(slot, dItemNo_HAWK_EYE_e);
+        g_disguisedItemSlot = slot;
     }
+}
+
+static void restoreLanternPost() {
+    if (g_disguisedItemSlot != NO_MIX_ITEM) {
+        dComIfGs_setItem(g_disguisedItemSlot, dItemNo_KANTERA_e);
+        g_disguisedItemSlot = NO_MIX_ITEM;
+    }
+}
+
+static HookAction on_set_mix_item_pre(ModContext*, void* args, void*, void*) {
+    disguiseLanternPre(mods::arg<dMenu_Ring_c*>(args, 0));
     return HOOK_CONTINUE;
+}
+
+static void on_set_mix_item_post(ModContext*, void* args, void*, void*) {
+    restoreLanternPost();
+
+    // setMixItem() reloads the sliding combo-icon textures (via setJumpItem -> setSelectItem)
+    // from save data *before* our restore above runs, so if the Lantern was involved it captured
+    // the disguised Hawkeye icon instead. Now that the real item is back in the save slot, call
+    // setJumpItem() again to reload the correct icon. Harmless to call unconditionally: it just
+    // re-reads the (now-correct) current combo state, exactly like the original call did.
+    mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
+}
+
+static HookAction on_is_mix_item_on_pre(ModContext*, void* args, void*, void*) {
+    disguiseLanternPre(mods::arg<dMenu_Ring_c*>(args, 0));
+    return HOOK_CONTINUE;
+}
+
+static void on_is_mix_item_on_post(ModContext*, void*, void*, void*) {
+    restoreLanternPost();
+}
+
+static HookAction on_is_mix_item_off_pre(ModContext*, void* args, void*, void*) {
+    disguiseLanternPre(mods::arg<dMenu_Ring_c*>(args, 0));
+    return HOOK_CONTINUE;
+}
+
+static void on_is_mix_item_off_post(ModContext*, void*, void*, void*) {
+    restoreLanternPost();
+}
+
+// True if the Bow is assigned to one of the two C-button slots and the Lantern is mixed into it,
+// the same way dItemNo_HAWK_ARROW_e/dItemNo_BOMB_ARROW_e detect their combos.
+//
+// When a combo is active, dComIfGs_getSelectItemIndex(selectItemIdx) holds the *partner* item's
+// inventory slot (e.g. the Lantern's slot) and dComIfGs_getMixItemIndex(selectItemIdx) holds
+// SLOT_4 (the Bow's fixed slot) -- not the other way around. dComIfGp_getSelectItem() already
+// confirms the mixed-in item is the Bow (it only returns dItemNo_BOW_e after swapping in that
+// case), so all that's left to check here is that the partner slot holds the Lantern.
+static bool checkBowLanternCombo() {
+    for (int selectItemIdx = 0; selectItemIdx < 2; selectItemIdx++) {
+        if (dComIfGp_getSelectItem(selectItemIdx) != dItemNo_BOW_e) {
+            continue;
+        }
+
+        u8 partnerSlot = dComIfGs_getSelectItemIndex(selectItemIdx);
+        if (dComIfGs_getItem(partnerSlot, false) == dItemNo_KANTERA_e) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// A second, independent attack collider (separate from the arrow's own main collider,
+// field_0x688) used purely so a fire-combo arrow's impact ignites flammable objects (candles,
+// firewood, torches, etc.) exactly like a lantern swing would. Ignitable objects all check for an
+// *exact* match on AtType (== AT_TYPE_LANTERN_SWING, not a bitmask test) before igniting, so this
+// can't be folded into field_0x688's own AtType: that collider has to keep its default
+// AT_TYPE_ARROW so normal arrow damage and enemy-specific arrow-hit reactions (several enemies key
+// special reactions off ChkAtType(AT_TYPE_ARROW)) keep working. This mirrors the game's own enemy
+// fire-arrow actor (d_a_e_arrow.cpp), which likewise layers a second, separate collider
+// (mCcFireEffSph) alongside its main hit collider (mCcAtSph) rather than overloading one
+// collider's AtType for two purposes - so yes, both AT_TYPE_ARROW and an AT_TYPE_LANTERN_SWING
+// effect can coexist on the same arrow, just not on the same collider.
+//
+// This is a CAPSULE (dCcD_Cps), not a sphere, and is re-Set() every frame from the arrow's actual
+// per-frame travel segment (old.pos -> current.pos, see updateFireArrowEffect below), exactly the
+// same way the arrow's own field_0x688 sweeps a capsule from its previous position out to a
+// forward-projected target every frame (daArrow_c::setArrowAt, d_a_arrow.cpp). A dCcD_Sph, in
+// contrast, is a purely static "is the sphere overlapping the target *this instant*" test -
+// cM3dGSph::cross()/cM3d_Cross_CylSph() (c_m3d_g_sph.cpp) never look at where the sphere was on
+// the previous frame, only its current center - so at typical arrow speeds (tens of units per
+// frame) a plain sphere can end up centered on either side of a torch's collider on consecutive
+// frames without a single frame's test ever finding the two overlapping, i.e. it can tunnel
+// straight through. A capsule spanning the actual distance travelled that frame can't skip past
+// anything in between, which is exactly why the game itself uses one (not a sphere) for the
+// arrow's own hit detection.
+//
+// mObj.mSrcObjHitInf.mObjAt.mBase.mSPrm's low nibble-and-a-bit (mask 0x1E, read back via
+// GetAtGrp()) is the collider's "attack group": cCcS::ChkNoHitAtTg() (c_cc_s.cpp) requires
+// (GetAtGrp() & targetTgGrp) != 0 before it will even attempt the geometric cross test at all, no
+// matter how the two colliders overlap in space. Leaving this at 0 (as an earlier version of this
+// collider did) makes GetAtGrp() always return 0, so the AND is always 0 and every single ignitable
+// object's Tg collider (all of which have a non-zero TgGrp, e.g. daFireWood_c::mCcDObjInfo's
+// 0xD8FBFFFF/0x1F) gets silently skipped every frame - the collider could never register a hit on
+// anything at all, regardless of position/radius/timing. 0x1A is the exact value daAlink_c's own
+// real lantern-swing collider (mAtSph) carries for its entire lifetime: it's Set() once from
+// l_sphSrc (d_a_alink.cpp, shared with the sword-swing collider) and initKandelaarSwing()
+// (d_a_alink_kandelaar.inc) never touches this field afterwards, only AtType/AtMtrl/R/etc.
+//
+// mCpsAttr's start/end/radius here are placeholders - both endpoints are degenerate (zero-length
+// capsule, i.e. effectively a point) until the first real per-frame Set() in
+// updateFireArrowEffect, which is harmless since the collider only ever gets registered with the
+// collision system (dComIfG_Ccsp()->Set()) once igniteActive is true and a real position has been
+// computed.
+static const dCcD_SrcCps l_igniteCpsSrc = {
+    {
+        {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x1A}, {0x0, 0x0}, 0x0}},  // mObj
+        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},                 // mGObjAt
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},                            // mGObjTg
+        {0x0},                                                        // mGObjCo
+    },                                                                 // mObjInf
+    {
+        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 50.0f}  // mCps (same radius as the real lantern-
+                                                          // swing collider, daAlink_c::
+                                                          // initKandelaarSwing)
+    }                                                    // mCpsAttr
+};
+
+// Tracks the fire trail particle and ignition collider for the player's own in-flight fire
+// arrows, so both can be re-anchored to each arrow's current position every frame (see
+// updateFireArrowEffect below). daArrow_c has no spare fields to stash these in, unlike the enemy
+// fire arrow actor's own mFireEMKeys/mCcFireEffSph, so they're tracked externally here instead,
+// keyed by the arrow's actor pointer (see arrowId below for why the pointer alone isn't enough).
+struct TrackedFireArrow {
+    daArrow_c* arrow = nullptr;
+    // The actor framework recycles daArrow_c instances out of a small fixed pool: once an arrow
+    // is deleted (embedded in a wall, landed, etc.), its memory is free to be handed straight back
+    // out to the very next arrow the player nocks. A raw daArrow_c* is therefore not a reliable
+    // way to tell "the same arrow, still in flight" apart from "a brand new arrow that just
+    // happens to have been allocated at the same address" - which, prior to tracking this,
+    // resulted in a new arrow inheriting a stale slot's already-hit collision bookkeeping
+    // (igniteStts) untouched, silently suppressing that new arrow's own ignition hits (works once
+    // right after the pool's addresses are all still fresh, then increasingly fails as arrows
+    // reuse addresses). fpc_ProcID (fpcM_GetID(), backed by fpcBs_MakeOfId()) is the actor
+    // framework's own per-spawn-unique identifier, unaffected by address reuse, and is what
+    // actually distinguishes these two cases - see trackFireArrow below.
+    fpc_ProcID arrowId = fpcM_ERROR_PROCESS_ID_e;
+    u32 particleKey = 0;
+    // Handed to the emitter via setUserWork() below; must outlive the emitter itself, so it's
+    // stored here rather than as a stack temporary.
+    cXyz velocity = {0.0f, 0.0f, 0.0f};
+    dCcD_Cps igniteCps;
+    // Its own dedicated Stts, rather than sharing the arrow's own field_0x64c. The collision
+    // system tracks per-hit dedup/apid state (e.g. ChkAtNoConHit()'s "already hit this frame/
+    // actor" bookkeeping) on the Stts itself, not on the individual At collider, so sharing
+    // field_0x688's Stts let its AT_TYPE_ARROW hit against a target silently suppress
+    // igniteCps's own AT_TYPE_LANTERN_SWING hit against that same target (or vice versa) -
+    // which is what was actually blocking ignition, not the At-set bit. A dedicated Stts (still
+    // Init'd with the arrow as its actor, same args field_0x64c itself uses) keeps the two
+    // colliders' hit-registration fully independent.
+    dCcD_Stts igniteStts;
+    // Only turned on once the arrow is actually fired (see arrowShooting's hook below). The
+    // cosmetic flame can start as soon as the arrow is nocked, but the collider that ignites
+    // flammable objects stays off until then, so merely drawing the bow back near a torch doesn't
+    // light it before the shot is actually released.
+    bool igniteActive = false;
+};
+
+// The player only ever has a handful of arrows in flight at once; a small ring buffer is more
+// than enough, and simply evicts the oldest tracked arrow (long since landed/despawned by then)
+// if it somehow fills up.
+static constexpr int MAX_TRACKED_FIRE_ARROWS = 8;
+static TrackedFireArrow g_fireArrows[MAX_TRACKED_FIRE_ARROWS];
+static int g_nextFireArrowSlot = 0;
+
+// (Re-)initializes a ring buffer slot for arrow/id, resetting every piece of per-arrow state -
+// this is the one and only place that's allowed to happen, so trackFireArrow (the only caller)
+// can't accidentally skip it for what's actually a brand new arrow instance (see arrowId's comment
+// on TrackedFireArrow above).
+static void initFireArrowSlot(TrackedFireArrow& slot, daArrow_c* arrow, fpc_ProcID id) {
+    slot.arrow = arrow;
+    slot.arrowId = id;
+    slot.particleKey = 0;
+    slot.igniteActive = false;
+    // Same Init() args daArrow_c itself uses for field_0x64c (d_a_arrow.cpp), so the ignition
+    // collider's Stts still correctly identifies the arrow as its owning actor - it just doesn't
+    // share field_0x688's hit-dedup/apid bookkeeping (see igniteStts's declaration above).
+    slot.igniteStts.Init(10, 0xff, arrow);
+    slot.igniteCps.Set(l_igniteCpsSrc);
+    slot.igniteCps.SetStts(&slot.igniteStts);
+}
+
+// Called both when an arrow is nocked (drawn back) and again when it's actually fired, to start
+// tracking its fire trail particle and (re-)initialize its ignition collider. Idempotent for the
+// same arrow instance: calling it again for an arrow that's already tracked (e.g. the
+// shooting-time call, for an arrow that was already tracked at nock time) is a no-op, so the same
+// arrow never ends up straddling two ring buffer slots at once. Not idempotent across different
+// arrow instances that happen to share an address (see arrowId's comment on TrackedFireArrow
+// above): that case re-initializes the existing slot in place instead of treating it as already
+// tracked, so a reused address can never keep serving a new arrow stale collision state left over
+// from whatever previously occupied that memory.
+static void trackFireArrow(daArrow_c* arrow) {
+    fpc_ProcID id = fpcM_GetID(arrow);
+
+    for (TrackedFireArrow& slot : g_fireArrows) {
+        if (slot.arrow == arrow) {
+            if (slot.arrowId != id) {
+                initFireArrowSlot(slot, arrow, id);
+            }
+            return;
+        }
+    }
+
+    TrackedFireArrow& slot = g_fireArrows[g_nextFireArrowSlot];
+    g_nextFireArrowSlot = (g_nextFireArrowSlot + 1) % MAX_TRACKED_FIRE_ARROWS;
+    initFireArrowSlot(slot, arrow, id);
+}
+
+// Called once the arrow is actually fired, to turn on the ignition collider for an already
+// (or newly) tracked arrow. Split out from trackFireArrow() so nocking an arrow can start its
+// cosmetic flame without also making it able to ignite things before the shot is released.
+static void activateFireArrowIgnition(daArrow_c* arrow) {
+    for (TrackedFireArrow& slot : g_fireArrows) {
+        if (slot.arrow == arrow) {
+            slot.igniteActive = true;
+            return;
+        }
+    }
+}
+
+// True while the arrow isn't actually flying (nocked and waiting to be released, or stopped/stuck
+// and waiting to be re-obtained), as opposed to genuinely moving through the air (procMove, or
+// procReturn/procSlingHit after deflecting off certain surfaces). Used to keep the fire trail's
+// particle trace callback from continuing to advance already-emitted trail particles along a
+// stale, no-longer-updated velocity once the arrow itself has stopped moving.
+static bool isArrowStationary(daArrow_c* arrow) {
+    return arrow->mProcFunc == &daArrow_c::procWait ||
+           arrow->mProcFunc == &daArrow_c::procBGStop ||
+           arrow->mProcFunc == &daArrow_c::procActorStop ||
+           arrow->mProcFunc == &daArrow_c::procActorControllStop;
+}
+
+// Called every frame for every live fire arrow (see on_arrow_execute_post). Re-issues the fire
+// trail particle emitter (by reusing its key) at the arrow's up-to-date position, exactly like the
+// Bulblin (Bokoblin) archers' own fire arrows keep their trail attached to the arrow in
+// fire_eff_set() (d_a_e_arrow.cpp) instead of spawning a new, stationary burst once. Also mirrors
+// that function's use of the particle "trace" callback: without it, each emitter only knows the
+// position it was (re)issued at and its own particles don't get interpolated towards the arrow's
+// position in between frames, so the trail can lag behind or, if re-issued too infrequently
+// relative to the arrow's speed, appear to not be there at all.
+//
+// The particle resource used is ID_ZF_J_FIRE02_FIRE, the common (always-resident, never behind
+// dPa_RM's per-room-pack bit) flame particle that lit torches (d_a_obj_ktOnFire.cpp), campfires
+// (d_a_obj_fireWood[2].cpp) and other fire objects across the game all fall back to using outside
+// of rooms with a fancier room-specific variant loaded - i.e. the general-purpose "open flame"
+// effect that's guaranteed to actually spawn in any area, unlike the previous attempt
+// (ID_IT_JN_ARWFIR_FIRE00), which - it turns out - is a dead resource ID never referenced anywhere
+// else in the game and never actually renders regardless of which pack is loaded.
+//
+// While the arrow is nocked (waiting to be released), the flame is drawn just in front of the
+// player's face and at the full "impact-sized" scale would cover most of the first-person aiming
+// view. Everywhere else (flying, or stuck after landing) keeps the normal, unscaled size.
+static constexpr f32 NOCKED_FLAME_SCALE = 1.0f / 3.0f;
+
+// Also re-anchors the ignition collider (see l_igniteSphSrc above) to the arrow's current
+// position every frame, the same way the arrow's own "stuck in wall" collider (field_0x7cc) is
+// simply re-issued at current.pos each frame rather than swept.
+static void updateFireArrowEffect(daArrow_c* arrow) {
+    for (TrackedFireArrow& slot : g_fireArrows) {
+        if (slot.arrow == arrow) {
+            // arrow->current.pos is the arrow's *held* origin - while nocked, that's the bow's
+            // grip/nock matrix (daAlink_c::getLeftItemMatrix(), see setKeepMatrix()), well behind
+            // the arrowhead, which is why the flame used to show at the bowstring instead. Bomb
+            // Arrows already solve exactly this for their fuse effect (setSmokePos(), which
+            // transforms a fixed near-tip offset by the arrow model's current base matrix rather
+            // than using current.pos), so reuse that same helper and its output (field_0x9cc) to
+            // put our own flame in the same visual spot, correctly tracking the tip whether the
+            // arrow is nocked, flying, or stuck. field_0x9cc/mSmokePos are otherwise only written
+            // by mArrowType==1 (Bomb Arrow) code, which the fire-arrow combo never applies to, so
+            // repurposing them here for a plain arrow doesn't collide with anything.
+            arrow->setSmokePos();
+
+            // While the arrow is nocked/waiting or has come to rest (stuck in a wall or an
+            // actor), it isn't actually moving frame-to-frame even though arrow->speed may still
+            // hold a stale, nonzero pre-impact (or never-set, pre-shot) value. Feeding that stale
+            // vector to the trace callback would otherwise keep dragging already-emitted trail
+            // particles forward indefinitely, e.g. straight through and out the other side of
+            // whatever the arrow just stuck into. Zero it out in those cases instead, so the
+            // trail settles into a small, stationary flame at the arrowhead.
+            slot.velocity = isArrowStationary(arrow) ? cXyz(0.0f, 0.0f, 0.0f) : arrow->speed;
+            slot.particleKey =
+                dComIfGp_particle_set(slot.particleKey, ID_ZF_J_FIRE02_FIRE,
+                                      &arrow->field_0x9cc, &arrow->shape_angle, NULL);
+
+            JPABaseEmitter* emitter = dComIfGp_particle_getEmitter(slot.particleKey);
+            if (emitter != NULL) {
+                emitter->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
+                emitter->setUserWork((uintptr_t)&slot.velocity);
+
+                f32 scale = arrow->mProcFunc == &daArrow_c::procWait ? NOCKED_FLAME_SCALE : 1.0f;
+                emitter->setGlobalParticleScale(scale, scale);
+            }
+
+            if (slot.igniteActive) {
+                // A capsule (unlike a sphere) needs actual endpoints, not just a center + radius:
+                // Set() the same way field_0x688 does every frame in setArrowAt() (d_a_arrow.cpp),
+                // except spanning the arrow's real, already-travelled distance this frame
+                // (old.pos -> current.pos) rather than a forward-projected guess - all that matters
+                // here is that nothing the arrow visually passed through this frame gets skipped,
+                // which a straight cast of the frame's actual movement guarantees regardless of
+                // arrow speed. CalcAtVec() (as field_0x688's own Set() call is likewise always
+                // followed by) derives the collider's direction vector from these same two points;
+                // it needs to be recomputed any time the endpoints move, so it's not something that
+                // can be set once up front and left alone.
+                static_cast<cM3dGCps*>(&slot.igniteCps)->Set(arrow->old.pos, arrow->current.pos, 50.0f);
+                slot.igniteCps.CalcAtVec();
+
+                // Mirrors daAlink_c's own real lantern-swing collider (d_a_alink.cpp, the
+                // checkKandelaarSwing(1) branch): setting the shape alone isn't enough for it to
+                // actually register hits, since the collision system skips any At-side collider
+                // whose "set" bit isn't on (see ChkAtSet() gating in d_cc_mass_s.cpp/d_cc_s.cpp).
+                // l_igniteCpsSrc's mObjAt.mBase.mSPrm doesn't include that bit (see its comment for
+                // the rest of that value), so it has to be turned on explicitly the first time this
+                // collider becomes active, the same way daAlink_c's mAtSph starts off and gets
+                // OnAtSetBit()'d only once an actual swing begins.
+                if (!slot.igniteCps.ChkAtSet()) {
+                    slot.igniteCps.OnAtSetBit();
+                }
+                dComIfG_Ccsp()->Set(&slot.igniteCps);
+            }
+            return;
+        }
+    }
+}
+
+static HookAction on_arrow_shooting_pre(ModContext*, void* args, void*, void*) {
+    daArrow_c* arrow = mods::arg<daArrow_c*>(args, 0);
+
+    daAlink_c* link = daAlink_getAlinkActorClass();
+    if (link == nullptr || !checkBowLanternCombo() || dComIfGs_getOil() == 0) {
+        return HOOK_CONTINUE;
+    }
+
+    // Same oil cost as a single lantern swing (daAlink_c::initKandelaarSwing).
+    dComIfGp_setItemOilCount(-link->mpHIO->mItem.mLantern.m.mShakeOilLoss);
+
+    // Mark the arrow's attack collider as fire, same as how Light Arrows mark theirs as
+    // dCcD_MTRL_LIGHT a few lines below in the original function. This keeps field_0x688's AtType
+    // at its default AT_TYPE_ARROW (so normal arrow damage and enemy-specific arrow-hit reactions
+    // still work), while still giving the arrow the elemental "fire" material property, exactly
+    // like Light Arrows do for dCcD_MTRL_LIGHT without touching their own AtType either.
+    arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
+
+    // The actual AT_TYPE_LANTERN_SWING ignition effect is provided by a second, independent
+    // collider tracked alongside the arrow (see trackFireArrow/l_igniteSphSrc below) rather than
+    // by this collider, since ignitable objects require an exact AtType match and AT_TYPE_ARROW
+    // can't be combined with AT_TYPE_LANTERN_SWING on one collider without losing one or the
+    // other. Usually already tracked from nock time (see on_alink_make_arrow_post below), so this
+    // is normally just a no-op that turns the ignition collider itself on.
+    trackFireArrow(arrow);
+    activateFireArrowIgnition(arrow);
+
+    Z2GetAudioMgr()->seStart(Z2SE_OBJ_ARROW_SHOT_FIRE, &arrow->current.pos, 0, 0, 1.0f, 1.0f, -1.0f,
+                             -1.0f, 0);
+
+    return HOOK_CONTINUE;
+}
+
+// Runs right after the Hero's Bow nocks a new arrow (drawing the bow back, or switching arrow
+// types mid-draw). Marks the arrow as a fire arrow immediately, purely so its cosmetic flame
+// effect (see updateFireArrowEffect) already shows on the arrowhead while the shot is being lined
+// up, matching how it looks once actually fired. Doesn't touch oil (that's only spent once the
+// arrow is actually released, in on_arrow_shooting_pre) or the ignition collider (see
+// activateFireArrowIgnition), so merely drawing the bow back near a torch can't ignite it.
+static void on_alink_make_arrow_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
+    if (!checkBowLanternCombo() || dComIfGs_getOil() == 0) {
+        return;
+    }
+
+    fopAc_ac_c* actor = link->mItemAcKeep.getActor();
+    if (actor == NULL || fopAcM_GetName(actor) != fpcNm_ARROW_e) {
+        return;
+    }
+
+    daArrow_c* arrow = static_cast<daArrow_c*>(actor);
+    arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
+    trackFireArrow(arrow);
+}
+
+static void on_arrow_execute_post(ModContext*, void* args, void*, void*) {
+    daArrow_c* arrow = mods::arg<daArrow_c*>(args, 0);
+    if (arrow->field_0x688.GetAtMtrl() == dCcD_MTRL_FIRE) {
+        updateFireArrowEffect(arrow);
+    }
 }
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    // Installs a pre hook on fopAcM_createItem.
-    ModResult result = mods::hook::add_pre<CreateItem>(on_create_item_pre);
+    ModResult result = mods::hook::add_pre<SetMixItem>(on_set_mix_item_pre);
     if (result != MOD_OK) {
-        mods::log::error("failed to install pre_hook on_create_item_pre");
+        mods::log::error("failed to install pre hook on_set_mix_item_pre");
         return result;
     }
 
-    mods::log::info("my_mod initialized");
+    result = mods::hook::add_post<SetMixItem>(on_set_mix_item_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_set_mix_item_post");
+        return result;
+    }
+
+    result = mods::hook::add_pre<IsMixItemOn>(on_is_mix_item_on_pre);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install pre hook on_is_mix_item_on_pre");
+        return result;
+    }
+
+    result = mods::hook::add_post<IsMixItemOn>(on_is_mix_item_on_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_is_mix_item_on_post");
+        return result;
+    }
+
+    result = mods::hook::add_pre<IsMixItemOff>(on_is_mix_item_off_pre);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install pre hook on_is_mix_item_off_pre");
+        return result;
+    }
+
+    result = mods::hook::add_post<IsMixItemOff>(on_is_mix_item_off_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_is_mix_item_off_post");
+        return result;
+    }
+
+    result = mods::hook::add_pre<ArrowShooting>(on_arrow_shooting_pre);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install pre hook on_arrow_shooting_pre");
+        return result;
+    }
+
+    result = mods::hook::add_post<ArrowExecute>(on_arrow_execute_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_arrow_execute_post");
+        return result;
+    }
+
+    result = mods::hook::add_post<AlinkMakeArrow>(on_alink_make_arrow_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_alink_make_arrow_post");
+        return result;
+    }
+
+    mods::log::info("fire_arrows initialized");
     return MOD_OK;
 }
 
