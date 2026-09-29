@@ -18,8 +18,8 @@
 
 DEFINE_MOD();
 
-IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(HookService, svc_hook);
+IMPORT_SERVICE(LogService, svc_log);
 
 // --------------------------------------------------------------------------------------------
 // Fire Arrows
