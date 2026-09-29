@@ -297,7 +297,21 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
             }
 
             if (slot.igniteActive) {
-                slot.igniteSph.SetC(arrow->current.pos);
+                // Mirrors daAlink_c's own real lantern-swing collider (d_a_alink.cpp, the
+                // checkKandelaarSwing(1) branch): re-centering the sphere alone isn't enough for
+                // it to actually register hits, since the collision system skips any At-side
+                // collider whose "set" bit isn't on (see ChkAtSet() gating in d_cc_mass_s.cpp/
+                // d_cc_s.cpp) - a bit dCcD_Sph::Set() always clears, so it has to be turned on
+                // explicitly the first time this collider becomes active. MoveCAt() (rather than
+                // plain SetC()) also keeps the collider's sweep vector up to date every frame
+                // after that, the same way the real lantern-swing collider does, so a
+                // fast-moving arrow can't tunnel past a torch/candle between two frames.
+                if (slot.igniteSph.ChkAtSet()) {
+                    slot.igniteSph.MoveCAt(arrow->current.pos);
+                } else {
+                    slot.igniteSph.OnAtSetBit();
+                    slot.igniteSph.StartCAt(arrow->current.pos);
+                }
                 dComIfG_Ccsp()->Set(&slot.igniteSph);
             }
             return;
