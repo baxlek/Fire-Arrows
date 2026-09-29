@@ -258,6 +258,18 @@ static bool isArrowStationary(daArrow_c* arrow) {
 static void updateFireArrowEffect(daArrow_c* arrow) {
     for (TrackedFireArrow& slot : g_fireArrows) {
         if (slot.arrow == arrow) {
+            // arrow->current.pos is the arrow's *held* origin - while nocked, that's the bow's
+            // grip/nock matrix (daAlink_c::getLeftItemMatrix(), see setKeepMatrix()), well behind
+            // the arrowhead, which is why the flame used to show at the bowstring instead. Bomb
+            // Arrows already solve exactly this for their fuse effect (setSmokePos(), which
+            // transforms a fixed near-tip offset by the arrow model's current base matrix rather
+            // than using current.pos), so reuse that same helper and its output (field_0x9cc) to
+            // put our own flame in the same visual spot, correctly tracking the tip whether the
+            // arrow is nocked, flying, or stuck. field_0x9cc/mSmokePos are otherwise only written
+            // by mArrowType==1 (Bomb Arrow) code, which the fire-arrow combo never applies to, so
+            // repurposing them here for a plain arrow doesn't collide with anything.
+            arrow->setSmokePos();
+
             // While the arrow is nocked/waiting or has come to rest (stuck in a wall or an
             // actor), it isn't actually moving frame-to-frame even though arrow->speed may still
             // hold a stale, nonzero pre-impact (or never-set, pre-shot) value. Feeding that stale
@@ -268,7 +280,7 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
             slot.velocity = isArrowStationary(arrow) ? cXyz(0.0f, 0.0f, 0.0f) : arrow->speed;
             slot.particleKey =
                 dComIfGp_particle_set(slot.particleKey, ID_ZF_J_FIRE02_FIRE,
-                                      &arrow->current.pos, &arrow->shape_angle, NULL);
+                                      &arrow->field_0x9cc, &arrow->shape_angle, NULL);
 
             JPABaseEmitter* emitter = dComIfGp_particle_getEmitter(slot.particleKey);
             if (emitter != NULL) {
