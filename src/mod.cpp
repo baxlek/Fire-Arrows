@@ -131,16 +131,41 @@ static bool checkBowLanternCombo() {
     return false;
 }
 
-// Tracks the fire trail particle for the player's own in-flight fire arrows, so it can be
-// re-anchored to each arrow's current position every frame (see updateFireArrowEffect below).
-// daArrow_c has no spare field to stash this in, unlike the enemy fire arrow actor's own
-// mFireEMKeys, so it's tracked externally here instead, keyed by the arrow's actor pointer.
+// A second, independent attack collider (separate from the arrow's own main collider,
+// field_0x688) used purely so a fire-combo arrow's impact ignites flammable objects (candles,
+// firewood, torches, etc.) exactly like a lantern swing would. Ignitable objects all check for an
+// *exact* match on AtType (== AT_TYPE_LANTERN_SWING, not a bitmask test) before igniting, so this
+// can't be folded into field_0x688's own AtType: that collider has to keep its default
+// AT_TYPE_ARROW so normal arrow damage and enemy-specific arrow-hit reactions (several enemies key
+// special reactions off ChkAtType(AT_TYPE_ARROW)) keep working. This mirrors the game's own enemy
+// fire-arrow actor (d_a_e_arrow.cpp), which likewise layers a second, separate collider
+// (mCcFireEffSph) alongside its main hit collider (mCcAtSph) rather than overloading one
+// collider's AtType for two purposes - so yes, both AT_TYPE_ARROW and an AT_TYPE_LANTERN_SWING
+// effect can coexist on the same arrow, just not on the same collider.
+static const dCcD_SrcSph l_igniteSphSrc = {
+    {
+        {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x0}, {0x0, 0x0}, 0x0}},  // mObj
+        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},                // mGObjAt
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},                           // mGObjTg
+        {0x0},                                                       // mGObjCo
+    },                                                                // mObjInf
+    {
+        {{0.0f, 0.0f, 0.0f}, 50.0f}  // mSph (same radius as daAlink_c::initKandelaarSwing)
+    }                                // mSphAttr
+};
+
+// Tracks the fire trail particle and ignition collider for the player's own in-flight fire
+// arrows, so both can be re-anchored to each arrow's current position every frame (see
+// updateFireArrowEffect below). daArrow_c has no spare fields to stash these in, unlike the enemy
+// fire arrow actor's own mFireEMKeys/mCcFireEffSph, so they're tracked externally here instead,
+// keyed by the arrow's actor pointer.
 struct TrackedFireArrow {
     daArrow_c* arrow = nullptr;
     u32 particleKey = 0;
     // Handed to the emitter via setUserWork() below; must outlive the emitter itself, so it's
     // stored here rather than as a stack temporary.
     cXyz velocity = {0.0f, 0.0f, 0.0f};
+    dCcD_Sph igniteSph;
 };
 
 // The player only ever has a handful of arrows in flight at once; a small ring buffer is more
@@ -151,16 +176,20 @@ static TrackedFireArrow g_fireArrows[MAX_TRACKED_FIRE_ARROWS];
 static int g_nextFireArrowSlot = 0;
 
 // Called once, right when an arrow is fired as part of the combo, to start tracking its fire
-// trail particle.
+// trail particle and (re-)initialize its ignition collider.
 static void trackFireArrow(daArrow_c* arrow) {
     TrackedFireArrow& slot = g_fireArrows[g_nextFireArrowSlot];
     g_nextFireArrowSlot = (g_nextFireArrowSlot + 1) % MAX_TRACKED_FIRE_ARROWS;
     slot.arrow = arrow;
     slot.particleKey = 0;
+    // Share the arrow's own collider Stts, same as how the enemy fire arrow's mCcAtSph,
+    // mCcTgSph and mCcFireEffSph all share a single mCcStts (d_a_e_arrow.cpp).
+    slot.igniteSph.Set(l_igniteSphSrc);
+    slot.igniteSph.SetStts(&arrow->field_0x64c);
 }
 
-// Called every frame for every live fire arrow (see on_arrow_execute_post). Re-issues the same
-// particle emitter (by reusing its key) at the arrow's up-to-date position, exactly like the
+// Called every frame for every live fire arrow (see on_arrow_execute_post). Re-issues the fire
+// trail particle emitter (by reusing its key) at the arrow's up-to-date position, exactly like the
 // Bulblin (Bokoblin) archers' own fire arrows keep their trail attached to the arrow in
 // fire_eff_set() (d_a_e_arrow.cpp) instead of spawning a new, stationary burst once. Also mirrors
 // that function's use of the particle "trace" callback: without it, each emitter only knows the
@@ -168,18 +197,23 @@ static void trackFireArrow(daArrow_c* arrow) {
 // position in between frames, so the trail can lag behind or, if re-issued too infrequently
 // relative to the arrow's speed, appear to not be there at all.
 //
-// Note this intentionally does NOT reuse the exact particle ID the enemy fire arrow uses
-// (dPa_RM(ID_ZI_S_RD_ARROWFIRE_A)): that ID is flagged (via dPa_RM's high bit) as belonging to a
-// per-room particle pack, which is only ever resident because bulblin archers' own spawn rooms
-// happen to bundle it. The player can fire a combo arrow in any room, most of which never load
-// that pack, so the effect would silently fail to appear. ID_IT_JN_ARWFIR_FIRE00 is the common
-// (always-resident) arrow-fire particle pack instead, so it's guaranteed to be loaded everywhere.
+// The particle resource used is ID_ZF_J_FIRE02_FIRE, the common (always-resident, never behind
+// dPa_RM's per-room-pack bit) flame particle that lit torches (d_a_obj_ktOnFire.cpp), campfires
+// (d_a_obj_fireWood[2].cpp) and other fire objects across the game all fall back to using outside
+// of rooms with a fancier room-specific variant loaded - i.e. the general-purpose "open flame"
+// effect that's guaranteed to actually spawn in any area, unlike the previous attempt
+// (ID_IT_JN_ARWFIR_FIRE00), which - it turns out - is a dead resource ID never referenced anywhere
+// else in the game and never actually renders regardless of which pack is loaded.
+//
+// Also re-anchors the ignition collider (see l_igniteSphSrc above) to the arrow's current
+// position every frame, the same way the arrow's own "stuck in wall" collider (field_0x7cc) is
+// simply re-issued at current.pos each frame rather than swept.
 static void updateFireArrowEffect(daArrow_c* arrow) {
     for (TrackedFireArrow& slot : g_fireArrows) {
         if (slot.arrow == arrow) {
             slot.velocity = arrow->speed;
             slot.particleKey =
-                dComIfGp_particle_set(slot.particleKey, ID_IT_JN_ARWFIR_FIRE00,
+                dComIfGp_particle_set(slot.particleKey, ID_ZF_J_FIRE02_FIRE,
                                       &arrow->current.pos, &arrow->shape_angle, NULL);
 
             JPABaseEmitter* emitter = dComIfGp_particle_getEmitter(slot.particleKey);
@@ -187,6 +221,9 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
                 emitter->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
                 emitter->setUserWork((uintptr_t)&slot.velocity);
             }
+
+            slot.igniteSph.SetC(arrow->current.pos);
+            dComIfG_Ccsp()->Set(&slot.igniteSph);
             return;
         }
     }
@@ -204,19 +241,17 @@ static HookAction on_arrow_shooting_pre(ModContext*, void* args, void*, void*) {
     dComIfGp_setItemOilCount(-link->mpHIO->mItem.mLantern.m.mShakeOilLoss);
 
     // Mark the arrow's attack collider as fire, same as how Light Arrows mark theirs as
-    // dCcD_MTRL_LIGHT a few lines below in the original function.
+    // dCcD_MTRL_LIGHT a few lines below in the original function. This keeps field_0x688's AtType
+    // at its default AT_TYPE_ARROW (so normal arrow damage and enemy-specific arrow-hit reactions
+    // still work), while still giving the arrow the elemental "fire" material property, exactly
+    // like Light Arrows do for dCcD_MTRL_LIGHT without touching their own AtType either.
     arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
 
-    // Also mark the collider's AtType as AT_TYPE_LANTERN_SWING, exactly like
-    // daAlink_c::initKandelaarSwing() sets on the lantern's own swing collider
-    // (d_a_alink_kandelaar.inc). Every ignitable object (candles, firewood, wdStick, pumpkins,
-    // etc.) checks for this exact AtType alongside dCcD_MTRL_FIRE before igniting; the bokoblin
-    // archer's own fire arrow uses a different AtType (AT_TYPE_CSTATUE_SWING) and so, in vanilla,
-    // never ignites those objects. Mimicking the lantern swing's AtType instead makes the combo
-    // arrow's impact ignite torches/braziers just like swinging the lantern at that spot would.
-    // Trade-off: a few enemies key special hit reactions off ChkAtType(AT_TYPE_ARROW), which
-    // won't trigger for these arrows since AtType is a single overwritten value, not a bitmask.
-    arrow->field_0x688.SetAtType(AT_TYPE_LANTERN_SWING);
+    // The actual AT_TYPE_LANTERN_SWING ignition effect is provided by a second, independent
+    // collider tracked alongside the arrow (see trackFireArrow/l_igniteSphSrc below) rather than
+    // by this collider, since ignitable objects require an exact AtType match and AT_TYPE_ARROW
+    // can't be combined with AT_TYPE_LANTERN_SWING on one collider without losing one or the
+    // other.
     trackFireArrow(arrow);
 
     Z2GetAudioMgr()->seStart(Z2SE_OBJ_ARROW_SHOT_FIRE, &arrow->current.pos, 0, 0, 1.0f, 1.0f, -1.0f,
