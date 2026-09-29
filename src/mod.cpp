@@ -45,8 +45,16 @@ DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, IsMixItemOff);
 
 // Hook target: the moment an arrow is actually released, where the game already special-cases
 // the arrow's attack material per arrow type (see the ARROW_TYPE_LIGHT branch below it in the
-// original code). This is where we mark the arrow as a fire arrow if the combo is active.
+// original code). This is where we (re-)mark the arrow as a fire arrow if the combo is active,
+// and where the fire-arrow's ignition effect (as opposed to its purely cosmetic flame, which can
+// already be showing at this point - see on_alink_make_arrow_post below) actually turns on.
 DEFINE_HOOK(&daArrow_c::arrowShooting, ArrowShooting);
+
+// Hook target: the moment the Hero's Bow nocks a new arrow (on drawing the bow back, and again
+// whenever the arrow type is switched mid-draw), well before it's actually released. This is
+// where we start the fire arrow's cosmetic flame effect early, so the arrowhead already looks lit
+// while the shot is being lined up, exactly like it looks once fired.
+DEFINE_HOOK(&daAlink_c::makeArrow, AlinkMakeArrow);
 
 // Hook target: the arrow's per-frame update. daArrow_c has no arrow-type value for "fire" (unlike
 // the enemy fire arrows in d_a_e_arrow.cpp), so we detect it via the attack material we set
@@ -166,6 +174,11 @@ struct TrackedFireArrow {
     // stored here rather than as a stack temporary.
     cXyz velocity = {0.0f, 0.0f, 0.0f};
     dCcD_Sph igniteSph;
+    // Only turned on once the arrow is actually fired (see arrowShooting's hook below). The
+    // cosmetic flame can start as soon as the arrow is nocked, but the collider that ignites
+    // flammable objects stays off until then, so merely drawing the bow back near a torch doesn't
+    // light it before the shot is actually released.
+    bool igniteActive = false;
 };
 
 // The player only ever has a handful of arrows in flight at once; a small ring buffer is more
@@ -175,17 +188,51 @@ static constexpr int MAX_TRACKED_FIRE_ARROWS = 8;
 static TrackedFireArrow g_fireArrows[MAX_TRACKED_FIRE_ARROWS];
 static int g_nextFireArrowSlot = 0;
 
-// Called once, right when an arrow is fired as part of the combo, to start tracking its fire
-// trail particle and (re-)initialize its ignition collider.
+// Called both when an arrow is nocked (drawn back) and again when it's actually fired, to start
+// tracking its fire trail particle and (re-)initialize its ignition collider. Idempotent: calling
+// it again for an arrow that's already tracked (e.g. the shooting-time call, for an arrow that was
+// already tracked at nock time) is a no-op, so the same arrow never ends up straddling two ring
+// buffer slots at once.
 static void trackFireArrow(daArrow_c* arrow) {
+    for (TrackedFireArrow& slot : g_fireArrows) {
+        if (slot.arrow == arrow) {
+            return;
+        }
+    }
+
     TrackedFireArrow& slot = g_fireArrows[g_nextFireArrowSlot];
     g_nextFireArrowSlot = (g_nextFireArrowSlot + 1) % MAX_TRACKED_FIRE_ARROWS;
     slot.arrow = arrow;
     slot.particleKey = 0;
+    slot.igniteActive = false;
     // Share the arrow's own collider Stts, same as how the enemy fire arrow's mCcAtSph,
     // mCcTgSph and mCcFireEffSph all share a single mCcStts (d_a_e_arrow.cpp).
     slot.igniteSph.Set(l_igniteSphSrc);
     slot.igniteSph.SetStts(&arrow->field_0x64c);
+}
+
+// Called once the arrow is actually fired, to turn on the ignition collider for an already
+// (or newly) tracked arrow. Split out from trackFireArrow() so nocking an arrow can start its
+// cosmetic flame without also making it able to ignite things before the shot is released.
+static void activateFireArrowIgnition(daArrow_c* arrow) {
+    for (TrackedFireArrow& slot : g_fireArrows) {
+        if (slot.arrow == arrow) {
+            slot.igniteActive = true;
+            return;
+        }
+    }
+}
+
+// True while the arrow isn't actually flying (nocked and waiting to be released, or stopped/stuck
+// and waiting to be re-obtained), as opposed to genuinely moving through the air (procMove, or
+// procReturn/procSlingHit after deflecting off certain surfaces). Used to keep the fire trail's
+// particle trace callback from continuing to advance already-emitted trail particles along a
+// stale, no-longer-updated velocity once the arrow itself has stopped moving.
+static bool isArrowStationary(daArrow_c* arrow) {
+    return arrow->mProcFunc == &daArrow_c::procWait ||
+           arrow->mProcFunc == &daArrow_c::procBGStop ||
+           arrow->mProcFunc == &daArrow_c::procActorStop ||
+           arrow->mProcFunc == &daArrow_c::procActorControllStop;
 }
 
 // Called every frame for every live fire arrow (see on_arrow_execute_post). Re-issues the fire
@@ -211,7 +258,14 @@ static void trackFireArrow(daArrow_c* arrow) {
 static void updateFireArrowEffect(daArrow_c* arrow) {
     for (TrackedFireArrow& slot : g_fireArrows) {
         if (slot.arrow == arrow) {
-            slot.velocity = arrow->speed;
+            // While the arrow is nocked/waiting or has come to rest (stuck in a wall or an
+            // actor), it isn't actually moving frame-to-frame even though arrow->speed may still
+            // hold a stale, nonzero pre-impact (or never-set, pre-shot) value. Feeding that stale
+            // vector to the trace callback would otherwise keep dragging already-emitted trail
+            // particles forward indefinitely, e.g. straight through and out the other side of
+            // whatever the arrow just stuck into. Zero it out in those cases instead, so the
+            // trail settles into a small, stationary flame at the arrowhead.
+            slot.velocity = isArrowStationary(arrow) ? cXyz(0.0f, 0.0f, 0.0f) : arrow->speed;
             slot.particleKey =
                 dComIfGp_particle_set(slot.particleKey, ID_ZF_J_FIRE02_FIRE,
                                       &arrow->current.pos, &arrow->shape_angle, NULL);
@@ -222,8 +276,10 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
                 emitter->setUserWork((uintptr_t)&slot.velocity);
             }
 
-            slot.igniteSph.SetC(arrow->current.pos);
-            dComIfG_Ccsp()->Set(&slot.igniteSph);
+            if (slot.igniteActive) {
+                slot.igniteSph.SetC(arrow->current.pos);
+                dComIfG_Ccsp()->Set(&slot.igniteSph);
+            }
             return;
         }
     }
@@ -251,13 +307,37 @@ static HookAction on_arrow_shooting_pre(ModContext*, void* args, void*, void*) {
     // collider tracked alongside the arrow (see trackFireArrow/l_igniteSphSrc below) rather than
     // by this collider, since ignitable objects require an exact AtType match and AT_TYPE_ARROW
     // can't be combined with AT_TYPE_LANTERN_SWING on one collider without losing one or the
-    // other.
+    // other. Usually already tracked from nock time (see on_alink_make_arrow_post below), so this
+    // is normally just a no-op that turns the ignition collider itself on.
     trackFireArrow(arrow);
+    activateFireArrowIgnition(arrow);
 
     Z2GetAudioMgr()->seStart(Z2SE_OBJ_ARROW_SHOT_FIRE, &arrow->current.pos, 0, 0, 1.0f, 1.0f, -1.0f,
                              -1.0f, 0);
 
     return HOOK_CONTINUE;
+}
+
+// Runs right after the Hero's Bow nocks a new arrow (drawing the bow back, or switching arrow
+// types mid-draw). Marks the arrow as a fire arrow immediately, purely so its cosmetic flame
+// effect (see updateFireArrowEffect) already shows on the arrowhead while the shot is being lined
+// up, matching how it looks once actually fired. Doesn't touch oil (that's only spent once the
+// arrow is actually released, in on_arrow_shooting_pre) or the ignition collider (see
+// activateFireArrowIgnition), so merely drawing the bow back near a torch can't ignite it.
+static void on_alink_make_arrow_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
+    if (!checkBowLanternCombo() || dComIfGs_getOil() == 0) {
+        return;
+    }
+
+    fopAc_ac_c* actor = link->mItemAcKeep.getActor();
+    if (actor == NULL || fopAcM_GetName(actor) != fpcNm_ARROW_e) {
+        return;
+    }
+
+    daArrow_c* arrow = static_cast<daArrow_c*>(actor);
+    arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
+    trackFireArrow(arrow);
 }
 
 static void on_arrow_execute_post(ModContext*, void* args, void*, void*) {
@@ -314,6 +394,12 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     result = mods::hook::add_post<ArrowExecute>(on_arrow_execute_post);
     if (result != MOD_OK) {
         mods::log::error("failed to install post hook on_arrow_execute_post");
+        return result;
+    }
+
+    result = mods::hook::add_post<AlinkMakeArrow>(on_alink_make_arrow_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_alink_make_arrow_post");
         return result;
     }
 
