@@ -150,13 +150,25 @@ static bool checkBowLanternCombo() {
 // (mCcFireEffSph) alongside its main hit collider (mCcAtSph) rather than overloading one
 // collider's AtType for two purposes - so yes, both AT_TYPE_ARROW and an AT_TYPE_LANTERN_SWING
 // effect can coexist on the same arrow, just not on the same collider.
+//
+// mObj.mSrcObjHitInf.mObjAt.mBase.mSPrm's low nibble-and-a-bit (mask 0x1E, read back via
+// GetAtGrp()) is the collider's "attack group": cCcS::ChkNoHitAtTg() (c_cc_s.cpp) requires
+// (GetAtGrp() & targetTgGrp) != 0 before it will even attempt the geometric cross test at all, no
+// matter how the two colliders overlap in space. Leaving this at 0 (as an earlier version of this
+// collider did) makes GetAtGrp() always return 0, so the AND is always 0 and every single ignitable
+// object's Tg collider (all of which have a non-zero TgGrp, e.g. daFireWood_c::mCcDObjInfo's
+// 0xD8FBFFFF/0x1F) gets silently skipped every frame - the collider could never register a hit on
+// anything at all, regardless of position/radius/timing. 0x1A is the exact value daAlink_c's own
+// real lantern-swing collider (mAtSph) carries for its entire lifetime: it's Set() once from
+// l_sphSrc (d_a_alink.cpp, shared with the sword-swing collider) and initKandelaarSwing()
+// (d_a_alink_kandelaar.inc) never touches this field afterwards, only AtType/AtMtrl/R/etc.
 static const dCcD_SrcSph l_igniteSphSrc = {
     {
-        {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x0}, {0x0, 0x0}, 0x0}},  // mObj
-        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},                // mGObjAt
-        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},                           // mGObjTg
-        {0x0},                                                       // mGObjCo
-    },                                                                // mObjInf
+        {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x1A}, {0x0, 0x0}, 0x0}},  // mObj
+        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},                 // mGObjAt
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},                            // mGObjTg
+        {0x0},                                                        // mGObjCo
+    },                                                                 // mObjInf
     {
         {{0.0f, 0.0f, 0.0f}, 50.0f}  // mSph (same radius as daAlink_c::initKandelaarSwing)
     }                                // mSphAttr
@@ -308,47 +320,23 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
             }
 
             if (slot.igniteActive) {
-                // igniteSph has to cover the same forward-swept region as the arrow's own main
-                // collider (field_0x688) does each frame, not just sit at the arrowhead's current
-                // position. field_0x688 is Set() every frame as a capsule from current.pos out to
-                // current.pos + speed * (getOutLengthRate() + 1.0f) (daArrow_c::setArrowAt,
-                // d_a_arrow.cpp) - a sweep roughly two frames' worth of travel *ahead* of the
-                // visible arrowhead, precisely so a fast arrow can't tunnel through something in a
-                // single frame. Because of that head start, field_0x688 reaches a torch/candle's
-                // own collider before igniteSph (previously anchored to plain current.pos) ever
-                // would, so the arrow already registers its own AT_TYPE_ARROW hit - and stops/
-                // deletes itself - before igniteSph gets within range to register its own
-                // AT_TYPE_LANTERN_SWING hit on the same object at all. Mirroring the same forward
-                // sweep here (center on the swept segment's midpoint, radius grown to cover its
-                // full length) lets igniteSph reach anything field_0x688 can reach on the very
-                // same frame, so its hit is the one still on record afterwards (see the
-                // "collision system"/Stts-sharing note above for why that's the one that wins).
-                cXyz igniteCenter = arrow->current.pos;
-                f32 igniteRadius = 50.0f;
-                if (!isArrowStationary(arrow)) {
-                    cXyz sweepTarget =
-                        arrow->current.pos + arrow->speed * (arrow->getOutLengthRate() + 1.0f);
-                    igniteCenter = (arrow->current.pos + sweepTarget) * 0.5f;
-                    igniteRadius = 50.0f + (sweepTarget - arrow->current.pos).abs() * 0.5f;
-                }
-                slot.igniteSph.SetR(igniteRadius);
-
                 // Mirrors daAlink_c's own real lantern-swing collider (d_a_alink.cpp, the
                 // checkKandelaarSwing(1) branch): re-centering the sphere alone isn't enough for
                 // it to actually register hits, since the collision system skips any At-side
                 // collider whose "set" bit isn't on (see ChkAtSet() gating in d_cc_mass_s.cpp/
-                // d_cc_s.cpp). l_igniteSphSrc's mObjAt.mBase.mSPrm starts at 0 (bit not set), so
-                // it has to be turned on explicitly the first time this collider becomes active,
-                // the same way daAlink_c's mAtSph starts off and gets OnAtSetBit()'d only once an
+                // d_cc_s.cpp). l_igniteSphSrc's mObjAt.mBase.mSPrm starts at 0x1A (bit 0, the "set"
+                // bit, still off - see l_igniteSphSrc's comment for the rest of that value), so it
+                // has to be turned on explicitly the first time this collider becomes active, the
+                // same way daAlink_c's mAtSph starts off and gets OnAtSetBit()'d only once an
                 // actual swing begins. MoveCAt() (rather than plain SetC()) also keeps the
-                // collider's sweep vector up to date every frame after that, the same way the
-                // real lantern-swing collider does, so a fast-moving arrow can't tunnel past a
-                // torch/candle between two frames.
+                // collider's sweep vector up to date every frame after that, the same way the real
+                // lantern-swing collider does, so a fast-moving arrow can't tunnel past a torch/
+                // candle between two frames.
                 if (slot.igniteSph.ChkAtSet()) {
-                    slot.igniteSph.MoveCAt(igniteCenter);
+                    slot.igniteSph.MoveCAt(arrow->current.pos);
                 } else {
                     slot.igniteSph.OnAtSetBit();
-                    slot.igniteSph.StartCAt(igniteCenter);
+                    slot.igniteSph.StartCAt(arrow->current.pos);
                 }
                 dComIfG_Ccsp()->Set(&slot.igniteSph);
             }
