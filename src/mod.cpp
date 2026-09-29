@@ -44,6 +44,28 @@ DEFINE_HOOK(&dMenu_Ring_c::setMixItem, SetMixItem);
 DEFINE_HOOK(&dMenu_Ring_c::isMixItemOn, IsMixItemOn);
 DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, IsMixItemOff);
 
+// Hook target: the input-handling function that decides what a menu button press does to the
+// highlighted item (assign to a C-button, combine, etc.) - setMixItem() (above) is one of the
+// things it can call, but it's not the only way an item ends up combined with the Bow. Some HUD
+// mods (e.g. Twilight HD HUD's third item slot) add a "Z" select-item slot the save format
+// already reserves for the Wii control scheme (SELECT_ITEM_DOWN, d_save.h) but the vanilla
+// GameCube-style menu code never uses; those mods implement combining into that slot themselves,
+// directly here in setActiveCursor, entirely bypassing setMixItem() and applying their own
+// item-type whitelist (which, same as the vanilla one, doesn't know about the Lantern) before
+// ever calling it. Disguising the Lantern here too, before any such mod's own hook can inspect
+// the highlighted item, lets their whitelist accept it exactly like the vanilla one already does.
+DEFINE_HOOK(&dMenu_Ring_c::setActiveCursor, SetActiveCursor);
+
+// Some other mods that hook these same four functions (see above) decide whether to accept the
+// highlighted item based on its real type, so our disguise has to be in place *before* any of
+// them look at it - a plain, unprioritized add_pre would only guarantee that by accident, purely
+// depending on mod load order. This priority is set far above the default (0) so our pre-hooks
+// always run first regardless of load order; the corresponding post-hooks use the same priority
+// so our restore also runs before any later mod's own post-hook needs to see the real item again
+// (e.g. to refresh a combo icon from save data, see on_set_mix_item_post below).
+static constexpr HookOptions kDisguiseHookOptions = {
+    sizeof(HookOptions), 1'000'000, HOOK_REPLACE_CONFLICT, nullptr};
+
 // Hook target: the moment an arrow is actually released, where the game already special-cases
 // the arrow's attack material per arrow type (see the ARROW_TYPE_LIGHT branch below it in the
 // original code). This is where we (re-)mark the arrow as a fire arrow if the combo is active,
@@ -117,6 +139,15 @@ static void on_is_mix_item_off_post(ModContext*, void*, void*, void*) {
     restoreLanternPost();
 }
 
+static HookAction on_set_active_cursor_pre(ModContext*, void* args, void*, void*) {
+    disguiseLanternPre(mods::arg<dMenu_Ring_c*>(args, 0));
+    return HOOK_CONTINUE;
+}
+
+static void on_set_active_cursor_post(ModContext*, void*, void*, void*) {
+    restoreLanternPost();
+}
+
 // True if the Bow is assigned to one of the two C-button slots and the Lantern is mixed into it,
 // the same way dItemNo_HAWK_ARROW_e/dItemNo_BOMB_ARROW_e detect their combos.
 //
@@ -125,14 +156,43 @@ static void on_is_mix_item_off_post(ModContext*, void*, void*, void*) {
 // SLOT_4 (the Bow's fixed slot) -- not the other way around. dComIfGp_getSelectItem() already
 // confirms the mixed-in item is the Bow (it only returns dItemNo_BOW_e after swapping in that
 // case), so all that's left to check here is that the partner slot holds the Lantern.
-static bool checkBowLanternCombo() {
-    for (int selectItemIdx = 0; selectItemIdx < 2; selectItemIdx++) {
-        if (dComIfGp_getSelectItem(selectItemIdx) != dItemNo_BOW_e) {
-            continue;
-        }
+static bool checkBowLanternComboInSlot(int selectItemIdx) {
+    if (dComIfGp_getSelectItem(selectItemIdx) != dItemNo_BOW_e) {
+        return false;
+    }
 
-        u8 partnerSlot = dComIfGs_getSelectItemIndex(selectItemIdx);
-        if (dComIfGs_getItem(partnerSlot, false) == dItemNo_KANTERA_e) {
+    u8 partnerSlot = dComIfGs_getSelectItemIndex(selectItemIdx);
+    return dComIfGs_getItem(partnerSlot, false) == dItemNo_KANTERA_e;
+}
+
+// True if the Bow is assigned to one of the save format's other select-item slots and the
+// Lantern is mixed into it there. SELECT_ITEM_NUM (2) and up (SELECT_ITEM_DOWN, i.e. a "Z" slot,
+// and beyond) are reserved by the save format for the Wii control scheme (d_save.h) and never
+// used by the vanilla GameCube-style menu code, but some HUD mods (e.g. Twilight HD HUD's third
+// item slot) revive one of them for an extra quick-item slot, managing its mix state directly
+// through dComIfGs_get/setMixItemIndex rather than through dMenu_Ring_c::setMixItem().
+// dComIfGp_getSelectItem()'s Bow-swap logic (d_com_inf_game.cpp) only special-cases
+// SELECT_ITEM_X/Y, so unlike checkBowLanternComboInSlot() above, this checks the raw save-data
+// mix/select index fields directly instead - the same fields any such mod itself has to use to
+// establish a combo for a slot the vanilla function doesn't know about.
+static bool checkBowLanternComboInExtraSlot(int selectItemIdx) {
+    if (dComIfGs_getMixItemIndex(selectItemIdx) != SLOT_4) {
+        return false;
+    }
+
+    u8 partnerSlot = dComIfGs_getSelectItemIndex(selectItemIdx);
+    return dComIfGs_getItem(partnerSlot, false) == dItemNo_KANTERA_e;
+}
+
+static bool checkBowLanternCombo() {
+    for (int selectItemIdx = 0; selectItemIdx < SELECT_ITEM_NUM; selectItemIdx++) {
+        if (checkBowLanternComboInSlot(selectItemIdx)) {
+            return true;
+        }
+    }
+
+    for (int selectItemIdx = SELECT_ITEM_NUM; selectItemIdx < MAX_SELECT_ITEM; selectItemIdx++) {
+        if (checkBowLanternComboInExtraSlot(selectItemIdx)) {
             return true;
         }
     }
@@ -467,39 +527,52 @@ static void on_arrow_execute_post(ModContext*, void* args, void*, void*) {
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    ModResult result = mods::hook::add_pre<SetMixItem>(on_set_mix_item_pre);
+    ModResult result = mods::hook::add_pre<SetMixItem>(on_set_mix_item_pre, &kDisguiseHookOptions);
     if (result != MOD_OK) {
         mods::log::error("failed to install pre hook on_set_mix_item_pre");
         return result;
     }
 
-    result = mods::hook::add_post<SetMixItem>(on_set_mix_item_post);
+    result = mods::hook::add_post<SetMixItem>(on_set_mix_item_post, &kDisguiseHookOptions);
     if (result != MOD_OK) {
         mods::log::error("failed to install post hook on_set_mix_item_post");
         return result;
     }
 
-    result = mods::hook::add_pre<IsMixItemOn>(on_is_mix_item_on_pre);
+    result = mods::hook::add_pre<IsMixItemOn>(on_is_mix_item_on_pre, &kDisguiseHookOptions);
     if (result != MOD_OK) {
         mods::log::error("failed to install pre hook on_is_mix_item_on_pre");
         return result;
     }
 
-    result = mods::hook::add_post<IsMixItemOn>(on_is_mix_item_on_post);
+    result = mods::hook::add_post<IsMixItemOn>(on_is_mix_item_on_post, &kDisguiseHookOptions);
     if (result != MOD_OK) {
         mods::log::error("failed to install post hook on_is_mix_item_on_post");
         return result;
     }
 
-    result = mods::hook::add_pre<IsMixItemOff>(on_is_mix_item_off_pre);
+    result = mods::hook::add_pre<IsMixItemOff>(on_is_mix_item_off_pre, &kDisguiseHookOptions);
     if (result != MOD_OK) {
         mods::log::error("failed to install pre hook on_is_mix_item_off_pre");
         return result;
     }
 
-    result = mods::hook::add_post<IsMixItemOff>(on_is_mix_item_off_post);
+    result = mods::hook::add_post<IsMixItemOff>(on_is_mix_item_off_post, &kDisguiseHookOptions);
     if (result != MOD_OK) {
         mods::log::error("failed to install post hook on_is_mix_item_off_post");
+        return result;
+    }
+
+    result = mods::hook::add_pre<SetActiveCursor>(on_set_active_cursor_pre, &kDisguiseHookOptions);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install pre hook on_set_active_cursor_pre");
+        return result;
+    }
+
+    result =
+        mods::hook::add_post<SetActiveCursor>(on_set_active_cursor_post, &kDisguiseHookOptions);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_set_active_cursor_post");
         return result;
     }
 
