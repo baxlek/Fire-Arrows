@@ -32,51 +32,86 @@ IMPORT_SERVICE(HookService, svc_hook);
 // dComIfGs_getMixItemIndex() returns this when a C-button slot has no item mixed into it.
 static constexpr u8 NO_MIX_ITEM = 0xFF;
 
-// Hook target: the menu code that lets the player drag one item onto another to combine them
-// (used natively for Bow+Bomb and Bow+Hawkeye). Its whitelist doesn't know about the Lantern, so
-// while the player is combining items we briefly present the Lantern as a Hawkeye (a combo the
-// whitelist already accepts), then restore the real item right after the call. This reuses all
-// of the vanilla combining/bookkeeping logic instead of reimplementing it.
+// Hook targets: the menu code that lets the player drag one item onto another to combine them
+// (used natively for Bow+Bomb and Bow+Hawkeye), plus the two functions that decide whether to
+// show the "Bow & Arrow Combo"/"Combo Off" prompt while an item is highlighted. All three have
+// their own whitelist switch that doesn't know about the Lantern, so while any of them run we
+// briefly present the highlighted Lantern as a Hawkeye (a combo the whitelists already accept),
+// then restore the real item right after the call. This reuses all of the vanilla
+// combining/bookkeeping and prompt-display logic instead of reimplementing it.
 DEFINE_HOOK(&dMenu_Ring_c::setMixItem, SetMixItem);
+DEFINE_HOOK(&dMenu_Ring_c::isMixItemOn, IsMixItemOn);
+DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, IsMixItemOff);
 
 // Hook target: the moment an arrow is actually released, where the game already special-cases
 // the arrow's attack material per arrow type (see the ARROW_TYPE_LIGHT branch below it in the
 // original code). This is where we mark the arrow as a fire arrow if the combo is active.
 DEFINE_HOOK(&daArrow_c::arrowShooting, ArrowShooting);
 
-// Slot temporarily disguised by on_set_mix_item_pre, restored by on_set_mix_item_post.
-// NO_MIX_ITEM means "nothing to restore".
+// Slot temporarily disguised by disguiseLanternPre(), restored by restoreLanternPost().
+// NO_MIX_ITEM means "nothing to restore". These hooks never nest (each menu function above runs
+// to completion before the next is called), so a single slot is enough to track the disguise.
 static u8 g_disguisedItemSlot = NO_MIX_ITEM;
 
-static HookAction on_set_mix_item_pre(ModContext*, void* args, void*, void*) {
-    dMenu_Ring_c* menu = mods::arg<dMenu_Ring_c*>(args, 0);
+static void disguiseLanternPre(dMenu_Ring_c* menu) {
     u8 slot = menu->mItemSlots[menu->mCurrentSlot];
 
     if (dComIfGs_getItem(slot, false) == dItemNo_KANTERA_e) {
         dComIfGs_setItem(slot, dItemNo_HAWK_EYE_e);
         g_disguisedItemSlot = slot;
     }
-
-    return HOOK_CONTINUE;
 }
 
-static void on_set_mix_item_post(ModContext*, void*, void*, void*) {
+static void restoreLanternPost() {
     if (g_disguisedItemSlot != NO_MIX_ITEM) {
         dComIfGs_setItem(g_disguisedItemSlot, dItemNo_KANTERA_e);
         g_disguisedItemSlot = NO_MIX_ITEM;
     }
 }
 
+static HookAction on_set_mix_item_pre(ModContext*, void* args, void*, void*) {
+    disguiseLanternPre(mods::arg<dMenu_Ring_c*>(args, 0));
+    return HOOK_CONTINUE;
+}
+
+static void on_set_mix_item_post(ModContext*, void*, void*, void*) {
+    restoreLanternPost();
+}
+
+static HookAction on_is_mix_item_on_pre(ModContext*, void* args, void*, void*) {
+    disguiseLanternPre(mods::arg<dMenu_Ring_c*>(args, 0));
+    return HOOK_CONTINUE;
+}
+
+static void on_is_mix_item_on_post(ModContext*, void*, void*, void*) {
+    restoreLanternPost();
+}
+
+static HookAction on_is_mix_item_off_pre(ModContext*, void* args, void*, void*) {
+    disguiseLanternPre(mods::arg<dMenu_Ring_c*>(args, 0));
+    return HOOK_CONTINUE;
+}
+
+static void on_is_mix_item_off_post(ModContext*, void*, void*, void*) {
+    restoreLanternPost();
+}
+
 // True if the Bow is assigned to one of the two C-button slots and the Lantern is mixed into it,
 // the same way dItemNo_HAWK_ARROW_e/dItemNo_BOMB_ARROW_e detect their combos.
+//
+// When a combo is active, dComIfGs_getSelectItemIndex(selectItemIdx) holds the *partner* item's
+// inventory slot (e.g. the Lantern's slot) and dComIfGs_getMixItemIndex(selectItemIdx) holds
+// SLOT_4 (the Bow's fixed slot) -- not the other way around. dComIfGp_getSelectItem() already
+// confirms the mixed-in item is the Bow (it only returns dItemNo_BOW_e after swapping in that
+// case), so all that's left to check here is that the partner slot holds the Lantern.
 static bool checkBowLanternCombo() {
     for (int selectItemIdx = 0; selectItemIdx < 2; selectItemIdx++) {
         if (dComIfGp_getSelectItem(selectItemIdx) != dItemNo_BOW_e) {
             continue;
         }
 
-        u8 mixSlot = dComIfGs_getMixItemIndex(selectItemIdx);
-        if (mixSlot != NO_MIX_ITEM && dComIfGs_getItem(mixSlot, false) == dItemNo_KANTERA_e) {
+        u8 partnerSlot = dComIfGs_getSelectItemIndex(selectItemIdx);
+        if (dComIfGs_getItem(partnerSlot, false) == dItemNo_KANTERA_e) {
             return true;
         }
     }
@@ -120,6 +155,30 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     result = mods::hook::add_post<SetMixItem>(on_set_mix_item_post);
     if (result != MOD_OK) {
         mods::log::error("failed to install post hook on_set_mix_item_post");
+        return result;
+    }
+
+    result = mods::hook::add_pre<IsMixItemOn>(on_is_mix_item_on_pre);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install pre hook on_is_mix_item_on_pre");
+        return result;
+    }
+
+    result = mods::hook::add_post<IsMixItemOn>(on_is_mix_item_on_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_is_mix_item_on_post");
+        return result;
+    }
+
+    result = mods::hook::add_pre<IsMixItemOff>(on_is_mix_item_off_pre);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install pre hook on_is_mix_item_off_pre");
+        return result;
+    }
+
+    result = mods::hook::add_post<IsMixItemOff>(on_is_mix_item_off_post);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install post hook on_is_mix_item_off_post");
         return result;
     }
 
