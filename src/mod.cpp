@@ -151,6 +151,19 @@ static bool checkBowLanternCombo() {
 // collider's AtType for two purposes - so yes, both AT_TYPE_ARROW and an AT_TYPE_LANTERN_SWING
 // effect can coexist on the same arrow, just not on the same collider.
 //
+// This is a CAPSULE (dCcD_Cps), not a sphere, and is re-Set() every frame from the arrow's actual
+// per-frame travel segment (old.pos -> current.pos, see updateFireArrowEffect below), exactly the
+// same way the arrow's own field_0x688 sweeps a capsule from its previous position out to a
+// forward-projected target every frame (daArrow_c::setArrowAt, d_a_arrow.cpp). A dCcD_Sph, in
+// contrast, is a purely static "is the sphere overlapping the target *this instant*" test -
+// cM3dGSph::cross()/cM3d_Cross_CylSph() (c_m3d_g_sph.cpp) never look at where the sphere was on
+// the previous frame, only its current center - so at typical arrow speeds (tens of units per
+// frame) a plain sphere can end up centered on either side of a torch's collider on consecutive
+// frames without a single frame's test ever finding the two overlapping, i.e. it can tunnel
+// straight through. A capsule spanning the actual distance travelled that frame can't skip past
+// anything in between, which is exactly why the game itself uses one (not a sphere) for the
+// arrow's own hit detection.
+//
 // mObj.mSrcObjHitInf.mObjAt.mBase.mSPrm's low nibble-and-a-bit (mask 0x1E, read back via
 // GetAtGrp()) is the collider's "attack group": cCcS::ChkNoHitAtTg() (c_cc_s.cpp) requires
 // (GetAtGrp() & targetTgGrp) != 0 before it will even attempt the geometric cross test at all, no
@@ -162,7 +175,13 @@ static bool checkBowLanternCombo() {
 // real lantern-swing collider (mAtSph) carries for its entire lifetime: it's Set() once from
 // l_sphSrc (d_a_alink.cpp, shared with the sword-swing collider) and initKandelaarSwing()
 // (d_a_alink_kandelaar.inc) never touches this field afterwards, only AtType/AtMtrl/R/etc.
-static const dCcD_SrcSph l_igniteSphSrc = {
+//
+// mCpsAttr's start/end/radius here are placeholders - both endpoints are degenerate (zero-length
+// capsule, i.e. effectively a point) until the first real per-frame Set() in
+// updateFireArrowEffect, which is harmless since the collider only ever gets registered with the
+// collision system (dComIfG_Ccsp()->Set()) once igniteActive is true and a real position has been
+// computed.
+static const dCcD_SrcCps l_igniteCpsSrc = {
     {
         {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x1A}, {0x0, 0x0}, 0x0}},  // mObj
         {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},                 // mGObjAt
@@ -170,8 +189,10 @@ static const dCcD_SrcSph l_igniteSphSrc = {
         {0x0},                                                        // mGObjCo
     },                                                                 // mObjInf
     {
-        {{0.0f, 0.0f, 0.0f}, 50.0f}  // mSph (same radius as daAlink_c::initKandelaarSwing)
-    }                                // mSphAttr
+        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 50.0f}  // mCps (same radius as the real lantern-
+                                                          // swing collider, daAlink_c::
+                                                          // initKandelaarSwing)
+    }                                                    // mCpsAttr
 };
 
 // Tracks the fire trail particle and ignition collider for the player's own in-flight fire
@@ -185,12 +206,12 @@ struct TrackedFireArrow {
     // Handed to the emitter via setUserWork() below; must outlive the emitter itself, so it's
     // stored here rather than as a stack temporary.
     cXyz velocity = {0.0f, 0.0f, 0.0f};
-    dCcD_Sph igniteSph;
+    dCcD_Cps igniteCps;
     // Its own dedicated Stts, rather than sharing the arrow's own field_0x64c. The collision
     // system tracks per-hit dedup/apid state (e.g. ChkAtNoConHit()'s "already hit this frame/
     // actor" bookkeeping) on the Stts itself, not on the individual At collider, so sharing
     // field_0x688's Stts let its AT_TYPE_ARROW hit against a target silently suppress
-    // igniteSph's own AT_TYPE_LANTERN_SWING hit against that same target (or vice versa) -
+    // igniteCps's own AT_TYPE_LANTERN_SWING hit against that same target (or vice versa) -
     // which is what was actually blocking ignition, not the At-set bit. A dedicated Stts (still
     // Init'd with the arrow as its actor, same args field_0x64c itself uses) keeps the two
     // colliders' hit-registration fully independent.
@@ -230,8 +251,8 @@ static void trackFireArrow(daArrow_c* arrow) {
     // collider's Stts still correctly identifies the arrow as its owning actor - it just doesn't
     // share field_0x688's hit-dedup/apid bookkeeping (see igniteStts's declaration above).
     slot.igniteStts.Init(10, 0xff, arrow);
-    slot.igniteSph.Set(l_igniteSphSrc);
-    slot.igniteSph.SetStts(&slot.igniteStts);
+    slot.igniteCps.Set(l_igniteCpsSrc);
+    slot.igniteCps.SetStts(&slot.igniteStts);
 }
 
 // Called once the arrow is actually fired, to turn on the ignition collider for an already
@@ -320,25 +341,31 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
             }
 
             if (slot.igniteActive) {
+                // A capsule (unlike a sphere) needs actual endpoints, not just a center + radius:
+                // Set() the same way field_0x688 does every frame in setArrowAt() (d_a_arrow.cpp),
+                // except spanning the arrow's real, already-travelled distance this frame
+                // (old.pos -> current.pos) rather than a forward-projected guess - all that matters
+                // here is that nothing the arrow visually passed through this frame gets skipped,
+                // which a straight cast of the frame's actual movement guarantees regardless of
+                // arrow speed. CalcAtVec() (as field_0x688's own Set() call is likewise always
+                // followed by) derives the collider's direction vector from these same two points;
+                // it needs to be recomputed any time the endpoints move, so it's not something that
+                // can be set once up front and left alone.
+                static_cast<cM3dGCps*>(&slot.igniteCps)->Set(arrow->old.pos, arrow->current.pos, 50.0f);
+                slot.igniteCps.CalcAtVec();
+
                 // Mirrors daAlink_c's own real lantern-swing collider (d_a_alink.cpp, the
-                // checkKandelaarSwing(1) branch): re-centering the sphere alone isn't enough for
-                // it to actually register hits, since the collision system skips any At-side
-                // collider whose "set" bit isn't on (see ChkAtSet() gating in d_cc_mass_s.cpp/
-                // d_cc_s.cpp). l_igniteSphSrc's mObjAt.mBase.mSPrm starts at 0x1A (bit 0, the "set"
-                // bit, still off - see l_igniteSphSrc's comment for the rest of that value), so it
-                // has to be turned on explicitly the first time this collider becomes active, the
-                // same way daAlink_c's mAtSph starts off and gets OnAtSetBit()'d only once an
-                // actual swing begins. MoveCAt() (rather than plain SetC()) also keeps the
-                // collider's sweep vector up to date every frame after that, the same way the real
-                // lantern-swing collider does, so a fast-moving arrow can't tunnel past a torch/
-                // candle between two frames.
-                if (slot.igniteSph.ChkAtSet()) {
-                    slot.igniteSph.MoveCAt(arrow->current.pos);
-                } else {
-                    slot.igniteSph.OnAtSetBit();
-                    slot.igniteSph.StartCAt(arrow->current.pos);
+                // checkKandelaarSwing(1) branch): setting the shape alone isn't enough for it to
+                // actually register hits, since the collision system skips any At-side collider
+                // whose "set" bit isn't on (see ChkAtSet() gating in d_cc_mass_s.cpp/d_cc_s.cpp).
+                // l_igniteCpsSrc's mObjAt.mBase.mSPrm doesn't include that bit (see its comment for
+                // the rest of that value), so it has to be turned on explicitly the first time this
+                // collider becomes active, the same way daAlink_c's mAtSph starts off and gets
+                // OnAtSetBit()'d only once an actual swing begins.
+                if (!slot.igniteCps.ChkAtSet()) {
+                    slot.igniteCps.OnAtSetBit();
                 }
-                dComIfG_Ccsp()->Set(&slot.igniteSph);
+                dComIfG_Ccsp()->Set(&slot.igniteCps);
             }
             return;
         }
