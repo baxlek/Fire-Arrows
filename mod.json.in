@@ -1,7 +1,23 @@
 {
-  "id": "com.example.fire_arrows",
+  "id": "dev.baxlek.fire_arrows",
   "name": "Fire Arrows",
   "version": "@PROJECT_VERSION@",
-  "author": "You",
-  "description": "Combine the Lantern with the Hero's Bow to shoot flaming arrows, just like a Bulblin archer, using oil from your lantern."
+  "author": "baxlek",
+  "description": "Combine the Lantern with the Hero's Bow to shoot flaming arrows using oil from your lantern.",
+  "abi": 1,
+  "imports": [
+    {
+      "service_id": "dev.twilitrealm.dusklight.hook",
+      "major": 1,
+      "min_minor": 1,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.log",
+      "major": 1,
+      "min_minor": 0,
+      "optional": false
+    },
+  ],
+  "exports": []
 }
