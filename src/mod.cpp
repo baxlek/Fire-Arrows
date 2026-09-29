@@ -308,6 +308,31 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
             }
 
             if (slot.igniteActive) {
+                // igniteSph has to cover the same forward-swept region as the arrow's own main
+                // collider (field_0x688) does each frame, not just sit at the arrowhead's current
+                // position. field_0x688 is Set() every frame as a capsule from current.pos out to
+                // current.pos + speed * (getOutLengthRate() + 1.0f) (daArrow_c::setArrowAt,
+                // d_a_arrow.cpp) - a sweep roughly two frames' worth of travel *ahead* of the
+                // visible arrowhead, precisely so a fast arrow can't tunnel through something in a
+                // single frame. Because of that head start, field_0x688 reaches a torch/candle's
+                // own collider before igniteSph (previously anchored to plain current.pos) ever
+                // would, so the arrow already registers its own AT_TYPE_ARROW hit - and stops/
+                // deletes itself - before igniteSph gets within range to register its own
+                // AT_TYPE_LANTERN_SWING hit on the same object at all. Mirroring the same forward
+                // sweep here (center on the swept segment's midpoint, radius grown to cover its
+                // full length) lets igniteSph reach anything field_0x688 can reach on the very
+                // same frame, so its hit is the one still on record afterwards (see the
+                // "collision system"/Stts-sharing note above for why that's the one that wins).
+                cXyz igniteCenter = arrow->current.pos;
+                f32 igniteRadius = 50.0f;
+                if (!isArrowStationary(arrow)) {
+                    cXyz sweepTarget =
+                        arrow->current.pos + arrow->speed * (arrow->getOutLengthRate() + 1.0f);
+                    igniteCenter = (arrow->current.pos + sweepTarget) * 0.5f;
+                    igniteRadius = 50.0f + (sweepTarget - arrow->current.pos).abs() * 0.5f;
+                }
+                slot.igniteSph.SetR(igniteRadius);
+
                 // Mirrors daAlink_c's own real lantern-swing collider (d_a_alink.cpp, the
                 // checkKandelaarSwing(1) branch): re-centering the sphere alone isn't enough for
                 // it to actually register hits, since the collision system skips any At-side
@@ -320,10 +345,10 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
                 // real lantern-swing collider does, so a fast-moving arrow can't tunnel past a
                 // torch/candle between two frames.
                 if (slot.igniteSph.ChkAtSet()) {
-                    slot.igniteSph.MoveCAt(arrow->current.pos);
+                    slot.igniteSph.MoveCAt(igniteCenter);
                 } else {
                     slot.igniteSph.OnAtSetBit();
-                    slot.igniteSph.StartCAt(arrow->current.pos);
+                    slot.igniteSph.StartCAt(igniteCenter);
                 }
                 dComIfG_Ccsp()->Set(&slot.igniteSph);
             }
