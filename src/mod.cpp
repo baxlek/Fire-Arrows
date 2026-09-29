@@ -174,6 +174,15 @@ struct TrackedFireArrow {
     // stored here rather than as a stack temporary.
     cXyz velocity = {0.0f, 0.0f, 0.0f};
     dCcD_Sph igniteSph;
+    // Its own dedicated Stts, rather than sharing the arrow's own field_0x64c. The collision
+    // system tracks per-hit dedup/apid state (e.g. ChkAtNoConHit()'s "already hit this frame/
+    // actor" bookkeeping) on the Stts itself, not on the individual At collider, so sharing
+    // field_0x688's Stts let its AT_TYPE_ARROW hit against a target silently suppress
+    // igniteSph's own AT_TYPE_LANTERN_SWING hit against that same target (or vice versa) -
+    // which is what was actually blocking ignition, not the At-set bit. A dedicated Stts (still
+    // Init'd with the arrow as its actor, same args field_0x64c itself uses) keeps the two
+    // colliders' hit-registration fully independent.
+    dCcD_Stts igniteStts;
     // Only turned on once the arrow is actually fired (see arrowShooting's hook below). The
     // cosmetic flame can start as soon as the arrow is nocked, but the collider that ignites
     // flammable objects stays off until then, so merely drawing the bow back near a torch doesn't
@@ -205,10 +214,12 @@ static void trackFireArrow(daArrow_c* arrow) {
     slot.arrow = arrow;
     slot.particleKey = 0;
     slot.igniteActive = false;
-    // Share the arrow's own collider Stts, same as how the enemy fire arrow's mCcAtSph,
-    // mCcTgSph and mCcFireEffSph all share a single mCcStts (d_a_e_arrow.cpp).
+    // Same Init() args daArrow_c itself uses for field_0x64c (d_a_arrow.cpp), so the ignition
+    // collider's Stts still correctly identifies the arrow as its owning actor - it just doesn't
+    // share field_0x688's hit-dedup/apid bookkeeping (see igniteStts's declaration above).
+    slot.igniteStts.Init(10, 0xff, arrow);
     slot.igniteSph.Set(l_igniteSphSrc);
-    slot.igniteSph.SetStts(&arrow->field_0x64c);
+    slot.igniteSph.SetStts(&slot.igniteStts);
 }
 
 // Called once the arrow is actually fired, to turn on the ignition collider for an already
@@ -301,11 +312,13 @@ static void updateFireArrowEffect(daArrow_c* arrow) {
                 // checkKandelaarSwing(1) branch): re-centering the sphere alone isn't enough for
                 // it to actually register hits, since the collision system skips any At-side
                 // collider whose "set" bit isn't on (see ChkAtSet() gating in d_cc_mass_s.cpp/
-                // d_cc_s.cpp) - a bit dCcD_Sph::Set() always clears, so it has to be turned on
-                // explicitly the first time this collider becomes active. MoveCAt() (rather than
-                // plain SetC()) also keeps the collider's sweep vector up to date every frame
-                // after that, the same way the real lantern-swing collider does, so a
-                // fast-moving arrow can't tunnel past a torch/candle between two frames.
+                // d_cc_s.cpp). l_igniteSphSrc's mObjAt.mBase.mSPrm starts at 0 (bit not set), so
+                // it has to be turned on explicitly the first time this collider becomes active,
+                // the same way daAlink_c's mAtSph starts off and gets OnAtSetBit()'d only once an
+                // actual swing begins. MoveCAt() (rather than plain SetC()) also keeps the
+                // collider's sweep vector up to date every frame after that, the same way the
+                // real lantern-swing collider does, so a fast-moving arrow can't tunnel past a
+                // torch/candle between two frames.
                 if (slot.igniteSph.ChkAtSet()) {
                     slot.igniteSph.MoveCAt(arrow->current.pos);
                 } else {
