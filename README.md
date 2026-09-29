@@ -1,6 +1,6 @@
 # Fire Arrows
 
-A standalone [Dusklight](https://github.com/TwilitRealm/dusklight) mod that allows you to combine Lantern with Bow to be able to shoot flaming arrows.
+A standalone [Dusklight](https://github.com/TwilitRealm/dusklight) mod that allows you to combine the Lantern with Hero's Bow to be able to shoot flaming arrows.
 
 See the [Dusklight modding documentation](https://github.com/TwilitRealm/dusklight/blob/main/docs/modding.md)
 for the full mod API: services, hooking game functions, asset overlays, and more.
