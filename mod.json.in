@@ -1,6 +1,6 @@
 {
   "id": "dev.baxlek.fire_arrows",
-  "name": "Fire Arrows",
+  "name": "Fire Arrows Standalone",
   "version": "@PROJECT_VERSION@",
   "author": "baxlek",
   "description": "Combine the Lantern with the Hero's Bow to shoot flaming arrows using oil from your lantern.",
