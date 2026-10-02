@@ -11,6 +11,7 @@
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
 #include "d/d_menu_ring.h"
+#include "d/d_meter2_draw.h"
 #include "d/d_particle_name.h"
 #include "d/d_save.h"
 #include "f_op/f_op_actor_mng.h"
@@ -83,6 +84,17 @@ DEFINE_HOOK(&daAlink_c::makeArrow, AlinkMakeArrow);
 // the enemy fire arrows in d_a_e_arrow.cpp), so we detect it via the attack material we set
 // ourselves in on_arrow_shooting_pre and use this to keep the fire trail following the arrow.
 DEFINE_HOOK(&daArrow_c::execute, ArrowExecute);
+
+// Hook target: the per-frame HUD draw call that positions and shows/hides the Lantern's oil-gauge
+// overlay over a C-button icon (dMeter2_c::execute decides the alpha argument every frame: 1.0f,
+// a sentinel this function itself expands into the button's real current alpha, if that slot's
+// item is exactly dItemNo_KANTERA_e, 0.0f/hidden otherwise). The gauge is purely an overlay drawn
+// on top of whatever icon texture the slot is already showing (drawKantera/drawKanteraMeter never
+// touch the icon itself), and the Bow+Lantern combo's C-button icon is just the ordinary Bow icon
+// (TP has no unique combined icon art for any Bow combo - Bow+Bomb and Bow+Hawkeye don't get one
+// either), so no new icon is needed here: only the visibility gate has to widen to also cover the
+// combo. See on_draw_kantera_meter_pre below for why the gate is otherwise closed for the combo.
+DEFINE_HOOK(&dMeter2Draw_c::drawKanteraMeter, DrawKanteraMeter);
 
 // Slot temporarily disguised by disguiseLanternPre(), restored by restoreLanternPost().
 // NO_MIX_ITEM means "nothing to restore". These hooks never nest (each menu function above runs
@@ -198,6 +210,32 @@ static bool checkBowLanternCombo() {
     }
 
     return false;
+}
+
+// dMeter2Draw_c::SELECT_X_e/SELECT_Y_e (0/1) are the same values checkBowLanternComboInSlot()
+// above already expects as its selectItemIdx - both identify a C-button slot via
+// dComIfGp_getSelectItem()'s indexing, so the button index drawKanteraMeter() is called with can
+// be passed straight through without any translation.
+//
+// drawKanteraMeter() is always called once per button per frame, with the gauge-visibility
+// decision (dItemNo_KANTERA_e vs. anything else) already baked into the incoming alpha before our
+// hook ever sees it: 1.0f (a sentinel drawKanteraMeter() itself expands into the button's real,
+// already fade/cutscene-aware current alpha) when visible, 0.0f when not. The Bow+Lantern combo
+// makes dComIfGp_getSelectItem() resolve to dItemNo_BOW_e for that slot (the same swap
+// checkBowLanternComboInSlot() itself accounts for), so the vanilla check always takes the "not
+// Kantera" branch and calls this with 0.0f even while oil is actively being spent. Re-arming that
+// same 1.0f sentinel here - instead of inventing our own alpha - keeps every other visibility rule
+// (HUD hidden, fading, wolf form, etc.) working exactly like it already does for the plain
+// Lantern, since it's the same lookup drawKanteraMeter() would have done for a real Kantera slot.
+static HookAction on_draw_kantera_meter_pre(ModContext*, void* args, void*, void*) {
+    u8 button = mods::arg<u8>(args, 1);
+    f32& alpha = mods::arg_ref<f32>(args, 2);
+
+    if (alpha == 0.0f && button < SELECT_ITEM_NUM && checkBowLanternComboInSlot(button)) {
+        alpha = 1.0f;
+    }
+
+    return HOOK_CONTINUE;
 }
 
 // A second, independent attack collider (separate from the arrow's own main collider,
@@ -591,6 +629,12 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     result = mods::hook::add_post<AlinkMakeArrow>(on_alink_make_arrow_post);
     if (result != MOD_OK) {
         mods::log::error("failed to install post hook on_alink_make_arrow_post");
+        return result;
+    }
+
+    result = mods::hook::add_pre<DrawKanteraMeter>(on_draw_kantera_meter_pre);
+    if (result != MOD_OK) {
+        mods::log::error("failed to install pre hook on_draw_kantera_meter_pre");
         return result;
     }
 
